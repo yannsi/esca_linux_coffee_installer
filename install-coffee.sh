@@ -3,9 +3,9 @@
 #  Esca Linux インストーラー（coffee版） — Arch Linux ベース・日本語環境セットアップ
 #
 #  coffee版について:
-#  オリジナルの install.sh から派生した個人プリセット版。
-#  このスクリプトを書き出した実機（dynabook T75/DG, Intel HD 620）専用として、
-#  構成を COSMIC + SDDM の一本に固定してある。
+#  オリジナルの install.sh から派生した版。特定の機種向けではなく、
+#  デスクトップ環境とログイン画面を COSMIC + SDDM の一本に固定してある。
+#  （動作確認は dynabook T75/DG, Intel HD 620 で行っている）
 #    デスクトップ = COSMIC（固定） / ログイン画面 = SDDM（固定） /
 #    日本語入力 = fcitx5-mozc（固定） / ファイルシステム = xfs（既定） /
 #    ufw = 有効 / OpenSSH = 無効 / yt-fzf-sh = 無効
@@ -13,7 +13,7 @@
 #  従来どおり対話で選ぶ。
 #
 #  【なぜ絞ったか】元は 8 種のデスクトップ環境と 5 種のログイン画面を
-#  選べたが、検証できる実機が1台しかなく、組み合わせの大半は一度も
+#  選べたが、組み合わせが多すぎて検証が追いつかず、大半は一度も
 #  実行されないまま「動くはず」のコードとして残っていた。動かしていない
 #  コードは壊れていても気付けないし、直しようもない。
 #  実際に使う構成だけを残し、そのぶん COSMIC まわりを厚く見る方針にした。
@@ -1332,7 +1332,7 @@ step_partition_scheme() {
   # ファイルシステム選択（手動時はユーザーが自分でフォーマットするため省略）
   if [[ "${CONFIG[partition_scheme]}" != "manual" ]]; then
     echo ""
-    echo -e "  ${YELLOW}ヒント: Enter で xfs（この実機の構成）。迷ったら ext4 も安全な選択です。${RESET}"
+    echo -e "  ${YELLOW}ヒント: Enter で xfs（coffee 版の既定）。迷ったら ext4 も安全な選択です。${RESET}"
     local fs
     # coffee版: xfs をデフォルトにする。select_from_list はサブシェルで動くため、
     # SELECT_DEFAULT はこのコマンドだけに前置きし、呼び出し元のシェルには残さない。
@@ -1603,7 +1603,7 @@ step_bootloader() {
     print_ok "ファームウェア: UEFI 検出"
 
     local bl
-    # coffee版: systemd-boot がデフォルト（このマシンの実際のブートローダー）
+    # coffee版: systemd-boot が既定（UEFI ならこれで足りる）
     bl=$(SELECT_DEFAULT=1 select_from_list "ブートローダーを選択:" \
       "systemd-boot（推奨・シンプル・追加パッケージ不要）" \
       "GRUB（マルチブートや特殊構成向け）")
@@ -1626,7 +1626,7 @@ step_bootloader() {
 # coffee 版は COSMIC + SDDM の一本構成。
 #
 # 【経緯】元は 8 種のデスクトップ環境と 5 種のログイン画面を選べたが、
-# 検証できる実機が1台しかなく、組み合わせの大半は一度も実行されない
+# 組み合わせが多すぎて検証が追いつかず、大半は一度も実行されない
 # まま「動くはず」のコードとして残っていた。動かないコードは直せない。
 # 実際に使う構成だけに絞り、そのぶん COSMIC まわりを厚く見る方針に変えた。
 # 他の環境が必要なら、汎用版の install.sh を使うこと。
@@ -1721,7 +1721,7 @@ step_config_source() {
   opts+=("引き継がない              - 各パッケージの既定設定のみ（素の状態）")
 
   # coffee版: ホストPCの設定が検出できた場合のみ、それを既定にする
-  # （常にこのマシンで実行する前提のため、opts[0] は必ず「ホストPCの設定を引き継ぐ」になる）。
+  # （ホストPCの設定が見つかった場合、opts[0] は必ず「ホストPCの設定を引き継ぐ」になる）。
   local sel
   if [[ -n "$host_dir" ]]; then
     sel=$(SELECT_DEFAULT=1 select_from_list "設定の引き継ぎ元を選択:" "${opts[@]}")
@@ -1805,7 +1805,7 @@ step_extra_packages() {
   echo ""
 
   # OpenSSH サーバー（セキュリティに関わるため質問を残す）
-  # coffee版: このマシンでは sshd を無効にしているため既定を No にする
+  # coffee版: 既定は No（使わない人にはリモートからの入口を開けない）
   if confirm "OpenSSH サーバーをインストール・有効化しますか？（リモート接続用）"; then
     CONFIG[extra_ssh]="yes"; print_ok "OpenSSH を有効化（sshd を自動起動）"
   else
@@ -1835,7 +1835,7 @@ step_extra_packages() {
   fi
 
   # yt-fzf-sh（GitHub の PKGBUILD・fzf/yt-dlp を使う対話的 YouTube ツール）
-  # coffee版: このマシンには入れていないため既定を No にする
+  # coffee版: 既定は No（必要な人だけが選ぶ任意ツール）
   if confirm "yt-fzf-sh をインストールしますか？（fzf/yt-dlp の YouTube ダウンローダ）"; then
     CONFIG[install_ytfzf]="yes"
     CONFIG[extra_base_devel]="yes"   # makepkg に base-devel が必要
@@ -1860,7 +1860,7 @@ step_extra_packages() {
   fi
 
   # ufw（任意）— SSH と併用する場合は 22 番ポートを自動許可
-  # coffee版: このマシンでは ufw を有効にしているため既定を Yes にする
+  # coffee版: 既定は Yes（ノート PC を外のネットワークにつなぐ前提で守りを固める）
   if confirm_yes "ufw（ファイアウォール）を有効にしますか？"; then
     CONFIG[extra_ufw]="yes"; print_ok "ufw を有効化"
   else
@@ -3910,7 +3910,7 @@ do_desktop() {
       if [[ "${CONFIG[desktop]}" == "cosmic" ]]; then
         rm -rf "${SKEL_ROOT}/.config/cosmic/com.system76.CosmicBackground" \
                "${SKEL_ROOT}/.config/cosmic/com.system76.CosmicSettings.Wallpaper"
-        # 【順序注意】ホストの ~/.config/cosmic には（このマシン自身の）
+        # 【順序注意】ホストの ~/.config/cosmic には（ホスト自身の）
         # 日本語フォント設定も含まれるため通常は上と矛盾しないが、
         # 将来ホスト側の設定が変わっても文字化けを再発させないよう、
         # コピー後に必ず上書きし直して JP フォントを保証する。
