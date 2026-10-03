@@ -5,7 +5,6 @@
 #  coffee版について:
 #  オリジナルの install.sh から派生した版。特定の機種向けではなく、
 #  デスクトップ環境とログイン画面を COSMIC + SDDM の一本に固定してある。
-#  （動作確認は dynabook T75/DG, Intel HD 620 で行っている）
 #    デスクトップ = COSMIC（固定） / ログイン画面 = SDDM（固定） /
 #    日本語入力 = fcitx5-mozc（固定） / ファイルシステム = xfs（既定） /
 #    ufw = 有効 / OpenSSH = 無効 / yt-fzf-sh = 無効
@@ -1400,7 +1399,7 @@ step_system() {
   # また AMD / ATI は大文字小文字を区別した単語として照合すること。
   # かつて全行に対して grep -qi "AMD\|ATI\|Radeon" をかけていたため、
   # Intel 機のホストブリッジ行「Intel Corporation」の "Corpor-ati-on" に一致し、
-  # Intel HD 620 の実機が AMD と誤判定されていた（amdgpu 用パッケージが入り、
+  # Intel GPU の機種が AMD と誤判定されていた（amdgpu 用パッケージが入り、
   # vulkan-intel が入らない）。自動採用で確認も出ないため、気付きにくい。
   local detected_gpu=""
   local recommended=""
@@ -2601,7 +2600,7 @@ do_pacstrap() {
     intel)
       # xf86-video-intel は X11 専用。COSMIC は Wayland なので不要。
       # intel-media-driver は動画のハードウェアデコード（VA-API, iHD）。
-      # Broadwell 以降（HD 620 を含む）が対象で、これが無いと Firefox や mpv の
+      # Broadwell（第5世代 Core）以降が対象で、これが無いと Firefox や mpv の
       # 動画再生が CPU デコードになり、負荷とバッテリー消費が大きく増える。
       pkgs+=(mesa vulkan-intel intel-media-driver)
       print_ok "Intel GPU (Wayland): mesa + vulkan-intel + intel-media-driver（xf86-video-intel はスキップ）"
