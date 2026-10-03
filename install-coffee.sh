@@ -239,7 +239,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _host_home() {
   # ── 設定ソースの選択（step_config_source で設定）──
   # 【重要】ここ一箇所で分岐させることで、_host_home を参照している全ての
-  # 呼び出し元（Waybar / Hyprland / Niri / 各種アプリ設定）に一括で効く。
+  # 呼び出し元（COSMIC・日本語入力・mpv などの設定複製）に一括で効く。
   # 呼び出し元はいずれも「空文字 or 存在しないパス」を安全に扱えるようになっている。
   #   host : ホストPC → GitHub → 無し（既定）
   #   git  : ホストPCを見ず、GitHub の dotfiles リポジトリを取得して使う
@@ -583,8 +583,6 @@ _strip_esca_glyph() {
 #
 # 【重要】v3 は U+F500-FD46 を廃止した。v2 時代の設定をそのまま持ち込むと、
 # フォントは入っているのにその文字だけ豆腐(□)になる。
-# Waybar 側 (write_waybar_config) には既に同じ置換があるが、
-# starship.toml は別経路でコピーされるため、ここでも同様に処理する必要がある。
 _fix_starship_nerdfont_v3() {
   local f="${SKEL_ROOT}/.config/starship.toml"
   [[ -f "$f" ]] || return 0
@@ -841,7 +839,7 @@ _read_input() {
     echo "" > "$dst"
     echo -e "  ${RED}✘ 入力を読み取れませんでした（入力が尽きたか、端末が切断されました）。${RESET}" > "$dst"
     echo -e "  ${GRAY}このスクリプトは対話式です。パイプ経由ではなく直接実行してください。${RESET}" > "$dst"
-    echo -e "  ${GRAY}例: sudo bash install.sh${RESET}" > "$dst"
+    echo -e "  ${GRAY}例: sudo bash $(basename "$0")${RESET}" > "$dst"
     exit 1
   fi
   _dest_ref="${_dest_ref:-}"
@@ -1334,7 +1332,7 @@ step_partition_scheme() {
   # ファイルシステム選択（手動時はユーザーが自分でフォーマットするため省略）
   if [[ "${CONFIG[partition_scheme]}" != "manual" ]]; then
     echo ""
-    echo -e "  ${YELLOW}ヒント: よく分からない場合は ext4（推奨）を選んでください。${RESET}"
+    echo -e "  ${YELLOW}ヒント: Enter で xfs（この実機の構成）。迷ったら ext4 も安全な選択です。${RESET}"
     local fs
     # coffee版: xfs をデフォルトにする。select_from_list はサブシェルで動くため、
     # SELECT_DEFAULT はこのコマンドだけに前置きし、呼び出し元のシェルには残さない。
@@ -1397,15 +1395,24 @@ step_system() {
   echo ""
 
   # GPU を自動検出して推奨を提示
+  #
+  # 【重要】lspci の全行ではなく、表示デバイスの行（VGA / 3D / Display）だけを見ること。
+  # また AMD / ATI は大文字小文字を区別した単語として照合すること。
+  # かつて全行に対して grep -qi "AMD\|ATI\|Radeon" をかけていたため、
+  # Intel 機のホストブリッジ行「Intel Corporation」の "Corpor-ati-on" に一致し、
+  # Intel HD 620 の実機が AMD と誤判定されていた（amdgpu 用パッケージが入り、
+  # vulkan-intel が入らない）。自動採用で確認も出ないため、気付きにくい。
   local detected_gpu=""
   local recommended=""
-  if lspci 2>/dev/null | grep -qi "NVIDIA"; then
+  local gpu_lines=""
+  gpu_lines=$(lspci 2>/dev/null | grep -E 'VGA compatible controller|3D controller|Display controller' || true)
+  if grep -qiw "NVIDIA" <<< "$gpu_lines"; then
     detected_gpu="NVIDIA"
     recommended="nvidia"
-  elif lspci 2>/dev/null | grep -qi "AMD\|ATI\|Radeon"; then
+  elif grep -qE '\b(AMD|ATI)\b|Radeon' <<< "$gpu_lines"; then
     detected_gpu="AMD"
     recommended="amdgpu"
-  elif lspci 2>/dev/null | grep -qi "Intel.*Graphics\|Intel.*VGA"; then
+  elif grep -qiw "Intel" <<< "$gpu_lines"; then
     detected_gpu="Intel"
     recommended="intel"
   elif systemd-detect-virt 2>/dev/null | grep -qiE "oracle|kvm|vmware|qemu"; then
@@ -1474,10 +1481,15 @@ step_users() {
   CONFIG[users]=""          # "user1:pw1:sudo:bash user2:pw2:nosudo:zsh" 形式で蓄積
   CONFIG[users_count]=0
 
+  # 【重要】一般ユーザーは最低1人必須。
+  # coffee 版は COSMIC + SDDM 固定で、SDDM は root を一覧に出さず、
+  # root でのデスクトップログインも想定していない。以前は 0 人のまま進めたため、
+  # インストールは成功するのにログイン画面から誰も入れない状態になりえた。
+  # AUR ビルド（makepkg は root 不可）も一般ユーザーが前提になっている。
   while true; do
     echo ""
     if [[ "${CONFIG[users_count]}" -eq 0 ]]; then
-      confirm "一般ユーザーを作成しますか？" || break
+      echo -e "  ${YELLOW}ログイン用の一般ユーザーを作成します（1人以上必須）${RESET}"
     else
       confirm "さらにユーザーを追加しますか？" || break
     fi
@@ -1867,38 +1879,6 @@ step_extra_packages() {
     print_ok "追加パッケージ: $extra"
   fi
 }
-
-# ============================================
-
-# ============================================
-# ホスト環境の検出（クローンモード用）
-# ============================================
-# クローンでは「ホストと同じ DE・DM」が唯一の正解になるため、
-# ユーザーに選ばせず実体から判定する。
-# 実機で判明した通り、ホストの設定（niri 用の fcitx5 autostart 無効化など）は
-# DE が違うと毒になる。選択肢を消すことが確実な対処になる。
-
-
-
-
-# ホストのパッケージ一覧を収集してファイルに書き出す。
-# 戻り値: 0 = 収集できた / 1 = 収集できない環境
-
-# ============================================
-# ステップ: インストールモードの選択
-# ============================================
-
-
-# ============================================
-# ステップ: ホスト環境のクローン
-# ============================================
-# このスクリプトを「今使っている Arch」から実行して別ディスクに入れる場合、
-# ホスト側の pacman DB を読めば「普段使っているアプリ一式」がそのまま分かる。
-# それを新環境にも入れることで、環境の作り直しをコマンド1回に短縮する。
-
-# インストーラ自身が決めるもの・ハードウェア固有のものは複製しない。
-# （ホストが NVIDIA でも新マシンが Intel なら nvidia は不要、など）
-
 
 # ============================================
 # 設定サマリー表示
@@ -2414,7 +2394,7 @@ step_mirror() {
   print_step "ミラーサーバー設定"
 
   # 日本語特化のため reflector --country Japan 固定。
-  # （reflector 失敗時のフォールバックは do_mirrorlist 側で処理）
+  # （reflector が失敗した場合は Live ISO の既存リストで続行する。do_mirrorlist 参照）
   CONFIG[mirror_country]="Japan"
   print_ok "ミラー: reflector で日本国内の速いミラーを自動選択（固定）"
 }
@@ -2433,13 +2413,41 @@ do_mirrorlist() {
   fi
 
   # 日本国内・HTTPS・最終同期24時間以内・速度順 上位8件
-  run_cmd_retry "reflector 実行（Japan・速度順）" \
-    reflector --country "${CONFIG[mirror_country]:-Japan}" \
-      --protocol https \
-      --age 24 \
-      --sort rate \
-      --number 8 \
-      --save /etc/pacman.d/mirrorlist
+  #
+  # 【重要】reflector の失敗でインストール全体を止めないこと。
+  # Live ISO の mirrorlist は起動時に既に reflector で作られており、
+  # 速さで劣るだけでそのまま使える。失敗したら元のリストに戻して続行する。
+  # 成功扱いでも条件に合うミラーが0件だと Server 行の無いリストが残るため、
+  # 中身も確認する（空のリストのままだと pacstrap が原因の分かりにくい形で落ちる）。
+  local ml="/etc/pacman.d/mirrorlist" ml_bak="/tmp/esca-mirrorlist.bak"
+  local desc="reflector 実行（Japan・速度順）"
+  if [[ "${CONFIG[dry_run]}" == "yes" ]]; then
+    print_warn "${desc} (ドライラン - スキップ)"
+    return 0
+  fi
+  cp -f "$ml" "$ml_bak" 2>/dev/null || true
+  echo -ne "  ${CYAN}…${RESET} ${desc}..."
+  if _exec_timed "$desc" \
+       reflector --country "${CONFIG[mirror_country]:-Japan}" \
+         --protocol https \
+         --age 24 \
+         --sort rate \
+         --number 8 \
+         --save "$ml" \
+     && grep -q '^Server' "$ml" 2>/dev/null; then
+    echo -e "\r  ${GREEN}✔${RESET} ${desc}                              "
+  else
+    echo -e "\r  ${YELLOW}⚠${RESET} ${desc} — 失敗                              "
+    if [[ -f "$ml_bak" ]]; then
+      cp -f "$ml_bak" "$ml" 2>/dev/null || true
+    fi
+    print_warn "Live ISO の既存ミラーリストで続行します（ログ: ${CONFIG[log_file]}）"
+  fi
+  if ! grep -q '^Server' "$ml" 2>/dev/null; then
+    print_err "使用できるミラーがありません（${ml} に Server 行がありません）。"
+    print_err "ネットワークを確認してから再実行してください。ディスクにはまだ触れていません。"
+    exit 1
+  fi
   print_ok "選択されたミラー:"
   grep '^Server' /etc/pacman.d/mirrorlist | sed 's/^/    /' || true
 }
@@ -2592,8 +2600,11 @@ do_pacstrap() {
     amdgpu)  pkgs+=(xf86-video-amdgpu mesa vulkan-radeon) ;;
     intel)
       # xf86-video-intel は X11 専用。COSMIC は Wayland なので不要。
-      pkgs+=(mesa vulkan-intel)
-      print_ok "Intel GPU (Wayland): mesa + vulkan-intel（xf86-video-intel はスキップ）"
+      # intel-media-driver は動画のハードウェアデコード（VA-API, iHD）。
+      # Broadwell 以降（HD 620 を含む）が対象で、これが無いと Firefox や mpv の
+      # 動画再生が CPU デコードになり、負荷とバッテリー消費が大きく増える。
+      pkgs+=(mesa vulkan-intel intel-media-driver)
+      print_ok "Intel GPU (Wayland): mesa + vulkan-intel + intel-media-driver（xf86-video-intel はスキップ）"
       ;;
     virtual) pkgs+=(xf86-video-vmware) ;;
   esac
@@ -2635,6 +2646,27 @@ do_pacstrap() {
 
   # IME（日本語特化のため fcitx5-mozc に固定）
   pkgs+=(fcitx5 fcitx5-mozc fcitx5-gtk fcitx5-qt fcitx5-configtool)
+
+  # 【重要】FONT は KEYMAP と同じ /etc/vconsole.conf に書く。
+  # 以前は KEYMAP 行だけを `>` で書き出していたため、ここで FONT を
+  # 別途追記しようとすると上書きで消える。1回の書き出しにまとめる。
+  #
+  # ter-116n = Terminus 8x16 通常字形。標準フォントと同じ高さのまま
+  # 字形が読みやすくなる無難な既定値。高解像度パネルで小さすぎる場合は
+  # ter-124n / ter-132n（12x24 / 16x32）に変更する。
+  #
+  # 【注意】コンソールフォントは PSF 形式で収録グリフ数に上限があり、
+  # Nerd Font のアイコンや Powerline 区切り記号は表示できない。
+  # TTY で starship の記号が豆腐になる場合はフォントではなくプリセット側で
+  # 対処する（starship preset plain-text-symbols）。
+  #
+  # 【重要】pacstrap より前に書くこと。vconsole.conf は initramfs の keymap /
+  # consolefont フックに取り込まれる。pacstrap 中の linux 導入で initramfs が
+  # 作られるので、先に置いておけばその1回で正しい内容になり、後から
+  # mkinitcpio -P をやり直す必要がなくなる（インストール時間の短縮）。
+  # vconsole.conf はどのパッケージも所有しないので、先に置いても衝突しない。
+  run_cmd "キーマップ・コンソールフォント設定" \
+    bash -c "mkdir -p /mnt/etc && printf 'KEYMAP=%s\nFONT=ter-116n\n' '${CONFIG[keymap]}' > /mnt/etc/vconsole.conf"
 
   run_cmd_retry "pacstrap 実行（時間がかかります）" pacstrap /mnt "${pkgs[@]}"
 }
@@ -2770,20 +2802,8 @@ EOF"
     "
   fi
 
-  # 【重要】FONT は KEYMAP と同じ /etc/vconsole.conf に書く。
-  # 以前は KEYMAP 行だけを `>` で書き出していたため、ここで FONT を
-  # 別途追記しようとすると上書きで消える。1回の書き出しにまとめる。
-  #
-  # ter-116n = Terminus 8x16 通常字形。標準フォントと同じ高さのまま
-  # 字形が読みやすくなる無難な既定値。高解像度パネルで小さすぎる場合は
-  # ter-124n / ter-132n（12x24 / 16x32）に変更する。
-  #
-  # 【注意】コンソールフォントは PSF 形式で収録グリフ数に上限があり、
-  # Nerd Font のアイコンや Powerline 区切り記号は表示できない。
-  # TTY で starship の記号が豆腐になる場合はフォントではなくプリセット側で
-  # 対処する（starship preset plain-text-symbols）。
-  run_cmd "キーマップ・コンソールフォント設定" \
-    bash -c "printf 'KEYMAP=%s\nFONT=ter-116n\n' '${CONFIG[keymap]}' > /mnt/etc/vconsole.conf"
+  # キーマップ・コンソールフォント（/etc/vconsole.conf）は do_pacstrap で
+  # pacstrap より前に書いている。initramfs に取り込まれるため（理由はそちら参照）。
 
   # X11 キーボードレイアウト設定
   # キーマップは jp106 固定のため X11 レイアウトも jp 固定
@@ -2986,7 +3006,12 @@ EOF"
   # 判定は partition_scheme ではなく「実際に swap があるか」で行う。
   # do_bootloader は scheme に関わらず swap があれば resume=PARTUUID= を渡すため、
   # auto_swap 限定にすると手動パーティション+swap でフックだけ欠けて不整合になる。
+  # initramfs の作り直しが要るか（mkinitcpio.conf を変更したときだけ true）。
+  # 変更が無ければ pacstrap 時に作られたものがそのまま正しい。
+  local initramfs_dirty="no"
+
   if [[ -n "${CONFIG[swap_part]}" ]]; then
+    initramfs_dirty="yes"
     run_cmd "mkinitcpio.conf に resume フックを追加" bash -c "
       if grep -q '^HOOKS=' /mnt/etc/mkinitcpio.conf; then
         # アドレス指定なしだとコメント内の例示 HOOKS 行まで書き換わるため /^HOOKS=/ に限定
@@ -2997,6 +3022,7 @@ EOF"
 
   # btrfs モジュール追加
   if [[ "${CONFIG[fs_type]}" == "btrfs" ]]; then
+    initramfs_dirty="yes"
     run_cmd "mkinitcpio.conf に btrfs モジュールを追加" bash -c "
       if grep -q '^MODULES=()' /mnt/etc/mkinitcpio.conf; then
         sed -i 's/^MODULES=()/MODULES=(btrfs)/' /mnt/etc/mkinitcpio.conf
@@ -3008,6 +3034,7 @@ EOF"
 
   # NVIDIA KMS 設定
   if [[ "${CONFIG[gpu_driver]}" == "nvidia" ]]; then
+    initramfs_dirty="yes"
     run_cmd "mkinitcpio.conf に NVIDIA モジュールを追加" bash -c "
       if grep -q '^MODULES=' /mnt/etc/mkinitcpio.conf; then
         # MODULES=() の場合と MODULES=(既存) の場合を分けて処理
@@ -3169,8 +3196,16 @@ EOF
   # OS 名・バナーの書き込み
   write_os_branding
 
-  # initramfs の再生成
-  run_cmd "initramfs 再生成 (mkinitcpio)" arch-chroot /mnt mkinitcpio -P
+  # initramfs の再生成。
+  # 【重要】mkinitcpio.conf を書き換えたときだけ行うこと。
+  # pacstrap の linux 導入時に既に生成されており（vconsole.conf も先に置いてある）、
+  # 何も変えていないのに作り直すと、fallback を含めて数十秒を無駄にする。
+  # 逆に mkinitcpio.conf を変えるコードを足したら、必ず initramfs_dirty を立てること。
+  if [[ "$initramfs_dirty" == "yes" ]]; then
+    run_cmd "initramfs 再生成 (mkinitcpio)" arch-chroot /mnt mkinitcpio -P
+  else
+    print_ok "initramfs: pacstrap 時に生成済みのものを使用（設定変更なしのため再生成を省略）"
+  fi
 }
 
 # ============================================
@@ -3316,9 +3351,14 @@ do_bootloader() {
     run_cmd "bootctl インストール" arch-chroot /mnt bootctl install
 
     # ローダー設定
+    # 起動メニューの待ち時間。Linux だけのディスクでは毎回の起動を待たせるだけなので
+    # 1 秒にする（その間に矢印キーを押せばメニューで止まり、fallback も選べる）。
+    # Windows があるときは選ぶ時間が要るので従来どおり 5 秒。
+    local loader_timeout=1
+    [[ "${CONFIG[windows_found]:-no}" == "yes" ]] && loader_timeout=5
     run_cmd "loader.conf 作成" bash -c "cat > /mnt/boot/loader/loader.conf << EOF
 default  arch.conf
-timeout  5
+timeout  ${loader_timeout}
 console-mode max
 editor   no
 EOF"
@@ -3557,14 +3597,6 @@ do_aur_helper() {
   AUR_TEMP_SUDOERS=""
 }
 
-# ============================================
-# ユーティリティ: Waybar 設定ファイルを生成
-# 引数1: WM 名（hyprland / niri）
-# ============================================
-
-# スクリーンショット保存用スクリプトを skel に配置する。
-# grim/slurp をそのまま使うと保存先が英語の ~/Pictures にフォールバックし、
-# 日本語のユーザーディレクトリ（~/ピクチャ）と別に英語フォルダが増えてしまう。
 # COSMIC 用の日本語フォント設定を /etc/skel に配置する。
 # COSMIC のシェルは cosmic-text（独自フォントDB）で描画し、fontconfig の
 # locale ベース match ルールを読まない。既定の Open Sans / Noto Sans Mono には
@@ -3611,10 +3643,14 @@ EOF"
 # ghostty に固定する。
 #
 # 【重要】/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1/system_actions
-# は cosmic-settings-daemon パッケージが所有するファイル。そこだけに書くと、
-# 次にパッケージが更新された時点で pacman に上書きされ、Super+T が
-# cosmic-term に戻る。ユーザー設定側にも置いて更新に耐えるようにする。
-# 優先度は custom > defaults > system_actions で、ユーザー設定が勝つ。
+# には絶対に書かないこと（cosmic-settings-daemon パッケージ所有のファイル）。
+# cosmic-settings-daemon は「システム側のファイルを丸ごと土台にし、
+# ユーザー側のファイルの項目で上書きする（extend）」という読み方をする。
+# かつてシステム側を Terminal の1行だけで上書きしていたため、土台にあった
+# ランチャー・アプリライブラリ・スクリーンショット・音量/輝度キー・Alt+Tab・
+# 画面ロックなどの割り当てがすべて消えていた。しかもパッケージ更新のたびに
+# 元のファイルへ戻るため、「直ったり壊れたりする」分かりにくい壊れ方をする。
+# ユーザー側は差分だけ書けばよいので、Terminal の1行で ghostty になる。
 write_cosmic_terminal_config() {
   [[ "${CONFIG[dry_run]}" == "yes" ]] && return 0
   local dir="${SKEL_ROOT}/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1"
@@ -3697,39 +3733,6 @@ write_libreoffice_cosmic_launchers() {
   ' || print_warn "LibreOffice の .desktop が見つからず、ランチャー上書きをスキップしました"
 }
 
-# xdg-user-dir PICTURES で「実際のピクチャディレクトリ（日本語名）」を解決し、
-# そこへ保存することで、日本語フォルダ名を保ったままスクショ先を一致させる。
-write_screenshot_script() {
-  [[ "${CONFIG[dry_run]}" == "yes" ]] && return 0
-  mkdir -p ${SKEL_ROOT}/.local/bin
-  cat > ${SKEL_ROOT}/.local/bin/screenshot.sh << 'SSEOF'
-#!/bin/sh
-# 使い方: screenshot.sh [area|screen]   （既定: area=範囲選択）
-# 保存先は xdg-user-dir が返す「ピクチャ」ディレクトリ（日本語名でもOK）。
-mode="${1:-area}"
-
-# ピクチャディレクトリを解決（未設定なら $HOME/ピクチャ を使う）
-pic_dir="$(xdg-user-dir PICTURES 2>/dev/null)"
-[ -z "$pic_dir" ] && pic_dir="$HOME/ピクチャ"
-save_dir="$pic_dir/スクリーンショット"
-mkdir -p "$save_dir"
-
-file="$save_dir/$(date +%Y-%m-%d_%H-%M-%S).png"
-
-case "$mode" in
-  screen) grim "$file" ;;
-  *)      grim -g "$(slurp)" "$file" ;;
-esac
-
-# 撮影に成功したらクリップボードにもコピーし、通知を出す
-if [ -f "$file" ]; then
-  wl-copy < "$file" 2>/dev/null || true
-  command -v notify-send >/dev/null 2>&1 &&     notify-send "スクリーンショット" "保存しました: $file" || true
-fi
-SSEOF
-  chmod +x ${SKEL_ROOT}/.local/bin/screenshot.sh
-  print_ok "スクリーンショット保存スクリプトを配置（保存先: ~/ピクチャ/スクリーンショット）"
-}
 
 
 # ============================================
@@ -3829,17 +3832,8 @@ do_desktop() {
   # 引き継がない場合はここで書いたものがそのまま残る。
   write_cosmic_favorites
   # coffee版: COSMIC の既定ターミナル（Super+T 等のシステムショートカット）を
-  # ghostty に設定する。壁紙と同じ考え方で「システム既定」として
-  # /usr/share/cosmic 配下に置き（config_source の選択に関係なく効く）、
-  # さらにユーザー設定にも同じものを焼き込む（理由は
+  # ghostty に設定する。ユーザー設定側だけに書く（理由は
   # write_cosmic_terminal_config のコメント参照）。
-  if [[ "${CONFIG[dry_run]}" != "yes" ]]; then
-    run_cmd "COSMIC 既定ターミナルを ghostty に設定" bash -c "
-      mkdir -p /mnt/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1
-      printf '{\n    Terminal: \"/usr/bin/ghostty\",\n}\n' \
-        > /mnt/usr/share/cosmic/com.system76.CosmicSettings.Shortcuts/v1/system_actions
-    "
-  fi
   write_cosmic_terminal_config
   # COSMIC のコンポジタ上では LibreOffice の gtk3 プラグインがネイティブ
   # Wayland だとメニューのポップアップを出せない（クリックしても開かない）。
@@ -3961,7 +3955,6 @@ do_desktop() {
 
       # テーマを試した残骸（*.bak / *.bak_cyberpunk / *_bak）を配布前に落とす。
       # 設定ファイル本体と紛らわしく、どれが本番か分からなくなるため。
-      # Waybar 側は write_waybar_config が既に同じ掃除をしている。
       run_cmd_soft "複製した設定のバックアップファイルを除去" \
         find ${SKEL_ROOT}/.config -type f \( -name '*.bak' -o -name '*.bak_*' -o -name '*_bak' -o -name '*.bak.*' \) -delete || true
     fi
@@ -4097,9 +4090,10 @@ Rectangle {
     // theme.conf の値。未設定でも動くよう既定値を用意する。
     // 日本語が豆腐になるのを避けるため CJK フォントを既定にしている。
     readonly property string uiFont: (typeof config !== "undefined" && config.font) ? config.font : "Noto Sans CJK JP"
-    // 発光の脈動。theme.conf の animateGlow=false で止められる。
-    // 文字列で来るため "false" との比較で判定する。
-    readonly property bool animateGlow: (typeof config !== "undefined" && String(config.animateGlow) === "false") ? false : true
+    // 下部ボタンの表示。theme.conf の showSessionButton / showPowerButtons を
+    // false にすると隠れる。値は文字列で来るため "false" との比較で判定する。
+    readonly property bool showSession: !(typeof config !== "undefined" && String(config.showSessionButton) === "false")
+    readonly property bool showPower:   !(typeof config !== "undefined" && String(config.showPowerButtons) === "false")
 
     // ============================================
     // 背景
@@ -4188,7 +4182,8 @@ Rectangle {
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "Esca Linux Coffee"
+            // テーマ名は write_sddm_theme が流し込む（例: Esca Linux Coffee）
+            text: "@@TITLE@@"
             color: root.textMain
             font.pixelSize: 26
             font.family: root.uiFont
@@ -4245,8 +4240,10 @@ Rectangle {
         anchors.left: parent.left
         anchors.bottom: parent.bottom
         anchors.margins: 36
-        label: "セッション: " + root.currentSessionName
+        // 一覧から選ぶまでは SDDM が覚えている前回のセッションが使われる
+        label: "セッション: " + (root.currentSessionName !== "" ? root.currentSessionName : "前回と同じ")
         textColor: root.textMain
+        visible: root.showSession
         onClicked: sessionPopup.visible = !sessionPopup.visible
     }
 
@@ -4258,6 +4255,7 @@ Rectangle {
         anchors.bottom: parent.bottom
         anchors.margins: 36
         spacing: 12
+        visible: root.showPower
 
         TextButton {
             label: "スリープ"
@@ -4503,10 +4501,6 @@ font=Noto Sans CJK JP
 # 下部のボタン表示。false にすると隠れる。
 showSessionButton=true
 showPowerButtons=true
-
-# ロゴの発光をゆっくり脈打たせる。false で静止する。
-# 発光レイヤーの opacity と scale だけを動かすので負荷は軽い。
-animateGlow=true
 ESCA_THEME_CONF_EOF
 
   cat > "${theme_dir}/metadata.desktop" <<'ESCA_METADATA_DESKTOP_EOF'
@@ -4556,6 +4550,7 @@ ESCA_METADATA_DESKTOP_EOF
       -e "s|@@GLOW_GOLD@@|${THEME_GLOW_GOLD}|g" \
       -e "s|@@TEXT_MAIN@@|${THEME_TEXT_MAIN}|g" \
       -e "s|@@TEXT_DIM@@|${THEME_TEXT_DIM}|g" \
+      -e "s|@@TITLE@@|${OS_NAME} ${THEME^}|g" \
       "${theme_dir}/${qml}"
   done
 
@@ -4855,9 +4850,13 @@ run_install() {
   CURRENT_STEP_NAME=""
   CURRENT_STEP_TS=0
 
+  # 【重要】ミラー選定はディスクを消す前に済ませること。
+  # do_mirrorlist は Live 環境の /etc/pacman.d/mirrorlist だけを書き換え、
+  # ディスクには触れない。一方ネットワーク次第で失敗しうる処理なので、
+  # 消去の後に置くと「ディスクは空になったのにインストールできない」状態で止まる。
+  do_mirrorlist
   do_partition
   do_format_and_mount
-  do_mirrorlist
   do_pacstrap
   do_fstab
   do_chroot_config
@@ -4935,7 +4934,7 @@ main() {
   # root チェック
   if [[ "$EUID" -ne 0 ]]; then
     echo -e "${RED}エラー: このスクリプトは root で実行してください。${RESET}"
-    echo "  例: sudo bash install.sh"
+    echo "  例: sudo bash $(basename "$0")"
     exit 1
   fi
 
@@ -5042,7 +5041,6 @@ main() {
       "システム設定を変更する（ホスト名・タイムゾーン・GPUなど）" \
       "ユーザー設定を変更する" \
       "ブートローダーを変更する" \
-      "デスクトップ環境を変更する" \
       "設定の引き継ぎを変更する（ホストPC / GitHub / なし）" \
       "ネットワーク設定を変更する" \
       "追加パッケージを変更する" \
@@ -5055,7 +5053,6 @@ main() {
       "システム設定を変更する（ホスト名・タイムゾーン・GPUなど）") step_system ;;
       "ユーザー設定を変更する")                     step_users ;;
       "ブートローダーを変更する")                   step_bootloader ;;
-      "デスクトップ環境を変更する")                 step_desktop ;;
       "設定の引き継ぎを変更する（ホストPC / GitHub / なし）") step_config_source ;;
       "ネットワーク設定を変更する")                 step_network ;;
       "追加パッケージを変更する")                   step_extra_packages ;;
