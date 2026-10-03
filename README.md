@@ -18,7 +18,7 @@ coffee 版は、オリジナルの [`install.sh`](https://github.com/yannsi/esca
 | 日本語入力 | fcitx5 + mozc（固定） |
 | ファイルシステム | xfs（既定。ext4 / btrfs も選択可） |
 | ブートローダー | systemd-boot（既定。GRUB も選択可、UEFI・BIOS 両対応） |
-| パーティション | 自動 / 手動（fdisk） |
+| パーティション | 自動（EFI 1GB + root、swap 付きも選択可） / 手動（fdisk） |
 | ufw | 有効（既定） |
 | OpenSSH | 無効（既定） |
 | yt-fzf | 無効（既定） |
@@ -52,7 +52,7 @@ bash install-coffee.sh --list-themes
 
 - ロケール `ja_JP.UTF-8`、タイムゾーン `Asia/Tokyo`、キーマップ `jp106`
 - 日本語入力は fcitx5 + mozc（切り替えは Ctrl + Space）
-- 日本語フォントと Nerd Font を導入し、漢字が中国語字形にならないよう fontconfig を設定
+- 日本語フォントと Nerd Font のアイコン（`ttf-nerd-fonts-symbols-mono`）を導入し、漢字が中国語字形にならないよう fontconfig を設定
 - ミラーは reflector で日本のものを選択
 
 COSMIC は独自のフォントデータベースで描画するため fontconfig の設定が効きません。シェル・テキストエディタ・ターミナルそれぞれに JP 付きフォントファミリを指定する設定を別途書き込みます。
@@ -136,6 +136,16 @@ ESCA_DOTFILES=/path/to/dotfiles bash install-coffee.sh
 
 ## 動作環境と既知の制限
 
+- GPU は自動で判定し、ドライバを選びます
+
+  | GPU | 導入するもの |
+  | --- | --- |
+  | Intel | mesa / vulkan-intel / intel-media-driver（動画のハードウェアデコード） |
+  | AMD | mesa / vulkan-radeon |
+  | NVIDIA（GTX 16xx / RTX 20xx 以降） | nvidia-open（公式ドライバ） |
+  | NVIDIA（GTX 10xx 以前） | nouveau（オープンソース版）。公式ドライバ 590 以降の対象外のため |
+
+  GTX 10xx 以前で性能が必要な場合は、インストール後に AUR の `nvidia-580xx-dkms` を導入してください。世代を判定できなかったときは手動選択になります
 - COSMIC では LibreOffice のメニューが開かない問題があるため、ランチャーに環境変数を前置した上書き版を配置します
 - 外付けディスクにインストールした場合、起動には UEFI/BIOS で起動順序の変更が必要です（手順は完了時に表示されます）
 - Google Chrome は AUR からビルドします。失敗しても中断せず、手順を表示して続行します
@@ -145,3 +155,7 @@ ESCA_DOTFILES=/path/to/dotfiles bash install-coffee.sh
 スクリプト本体は MIT ライセンスです（[LICENSE](LICENSE) を参照）。
 
 壁紙・ログイン画面の背景画像は生成 AI を用いて作成したものを基にしており、MIT の対象には含めていません。再配布や商用利用を考える場合は各自でご判断ください。
+
+## 開発
+
+push のたびに GitHub Actions で `bash -n` と `shellcheck -S warning` を実行しています（`.github/workflows/shellcheck.yml`）。

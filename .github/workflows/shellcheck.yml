@@ -1,0 +1,35 @@
+name: shellcheck
+
+# push / プルリクエストのたびに、インストーラーの構文と危険な書き方を検査する。
+# 手元で毎回実行している `bash -n` と `shellcheck -S warning` と同じ内容。
+on:
+  push:
+    paths:
+      - "**.sh"
+      - ".github/workflows/shellcheck.yml"
+  pull_request:
+    paths:
+      - "**.sh"
+      - ".github/workflows/shellcheck.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 構文チェック (bash -n)
+        run: |
+          for f in *.sh; do
+            echo "== $f"
+            bash -n "$f"
+          done
+
+      - name: shellcheck (warning 以上)
+        run: |
+          shellcheck --version
+          shellcheck -S warning ./*.sh

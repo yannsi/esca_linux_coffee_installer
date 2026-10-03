@@ -150,7 +150,7 @@ declare -A CONFIG=(
   # swap_part が空文字なら「swap なし」を意味する。
   [root_part]=""
   [swap_part]=""
-  [fs_type]="ext4"
+  [fs_type]="xfs"
   [desktop]="none"
   [dm]="none"
   # 設定の引き継ぎ元: host / git / none （step_config_source で選択）
@@ -173,11 +173,11 @@ declare -A CONFIG=(
   [log_file]="$LOG_FILE"
   [gpu_driver]="none"
   [aur_helper]="yay"
-  [extra_ssh]="yes"
-  [extra_ufw]="no"
+  [extra_ssh]="no"
+  [extra_ufw]="yes"
   [extra_fstrim]="yes"
   [install_chrome]="yes"
-  [install_ytfzf]="yes"
+  [install_ytfzf]="no"
   [install_office]="yes"
   [virt_env]="none"
   [cpu_vendor]=""
@@ -1317,13 +1317,13 @@ step_partition_scheme() {
 
   local scheme
   scheme=$(select_from_list "パーティション構成を選択:" \
-    "自動（推奨） - EFI 512M + / のみ（swap なし・zram 推奨）" \
-    "自動 - EFI 512M + swap (RAM同容量) + /（ハイバネート使用時）" \
+    "自動（推奨） - EFI 1G + / のみ（swap なし・zram 推奨）" \
+    "自動 - EFI 1G + swap (RAM同容量) + /（ハイバネート使用時）" \
     "手動（fdisk を起動）")
 
   case "$scheme" in
-    "自動（推奨） - EFI 512M + / のみ（swap なし・zram 推奨）") CONFIG[partition_scheme]="auto_noswap" ;;
-    "自動 - EFI 512M + swap (RAM同容量) + /（ハイバネート使用時）") CONFIG[partition_scheme]="auto_swap" ;;
+    "自動（推奨） - EFI 1G + / のみ（swap なし・zram 推奨）") CONFIG[partition_scheme]="auto_noswap" ;;
+    "自動 - EFI 1G + swap (RAM同容量) + /（ハイバネート使用時）") CONFIG[partition_scheme]="auto_swap" ;;
     "手動（fdisk を起動）")                                        CONFIG[partition_scheme]="manual" ;;
   esac
   print_ok "パーティション構成: ${CONFIG[partition_scheme]}"
@@ -1351,6 +1351,28 @@ step_partition_scheme() {
 # ============================================
 # ステップ 3: システム設定
 # ============================================
+
+# NVIDIA GPU の世代を lspci の表示デバイス行から判定し、new / old / unknown を返す。
+#
+# 【経緯】Arch は 2025年12月のドライバ 590 で、公式パッケージを nvidia から
+# nvidia-open（オープンカーネルモジュール）へ切り替え、同時に Pascal（GTX 10xx）
+# 以前のサポートを打ち切った。旧世代に nvidia-open を入れると画面が出ない。
+#   new : Turing 以降（TU / GA / AD / GB / GH）→ nvidia-open
+#   old : Pascal 以前（GP / GM / GK / GF / GT / G8x 等）→ nouveau
+# lspci は "NVIDIA Corporation TU117M [GeForce GTX 1650 Mobile]" のように
+# チップのコード名を出すので、その接頭辞で判定する。
+# 引数1: lspci の表示デバイス行（複数行可。NVIDIA の行だけを見る）
+_nvidia_generation() {
+  local code
+  code=$(grep -i 'nvidia' <<< "$1" \
+    | grep -oE '\b(TU|GA|AD|GB|GH|GP|GM|GK|GF|GT|G)[0-9]{2,3}[A-Z]?\b' \
+    | head -n1 || true)
+  case "$code" in
+    TU*|GA*|AD*|GB*|GH*) echo "new" ;;
+    "")                  echo "unknown" ;;
+    *)                   echo "old" ;;
+  esac
+}
 
 step_system() {
   print_step "システム設定"
@@ -1406,8 +1428,26 @@ step_system() {
   local gpu_lines=""
   gpu_lines=$(lspci 2>/dev/null | grep -E 'VGA compatible controller|3D controller|Display controller' || true)
   if grep -qiw "NVIDIA" <<< "$gpu_lines"; then
-    detected_gpu="NVIDIA"
-    recommended="nvidia"
+    # 【重要】NVIDIA は世代で入れるものが変わる。理由は _nvidia_generation を参照。
+    case "$(_nvidia_generation "$gpu_lines")" in
+      new)
+        detected_gpu="NVIDIA（Turing 以降）"
+        recommended="nvidia"
+        ;;
+      old)
+        detected_gpu="NVIDIA（Pascal 以前）"
+        recommended="nouveau"
+        print_warn "この NVIDIA GPU は公式ドライバ（590 以降）の対象外の世代です。"
+        echo "      オープンソースの nouveau を使います（画面表示はそのまま動きます）。"
+        echo "      性能が必要な場合は、インストール後に AUR の nvidia-580xx-dkms を"
+        echo "      導入できます（詳しくは ArchWiki の NVIDIA の項目を参照）。"
+        ;;
+      *)
+        # 世代が読み取れないときは推測で入れない。ドライバが合わないと
+        # 画面が出ず、TTY からの復旧が必要になるため、手動選択に回す。
+        print_warn "NVIDIA GPU を検出しましたが、世代を判定できませんでした。"
+        ;;
+    esac
   elif grep -qE '\b(AMD|ATI)\b|Radeon' <<< "$gpu_lines"; then
     detected_gpu="AMD"
     recommended="amdgpu"
@@ -1437,16 +1477,16 @@ step_system() {
 
   local gpu
   gpu=$(select_from_list "GPU ドライバーを選択してください:" \
-    "NVIDIA    - NVIDIA 製 GPU（GeForce など）※ゲーミング PC に多い" \
-    "NVIDIA    - NVIDIA 製 GPU（オープンソース版 Nouveau）" \
+    "NVIDIA    - GTX 16xx / RTX 20xx 以降（公式ドライバ nvidia-open）" \
+    "NVIDIA    - GTX 10xx 以前・不明な場合（オープンソース版 Nouveau）" \
     "AMD       - AMD 製 GPU（Radeon など）" \
     "Intel     - Intel 内蔵グラフィックス（CPU 内蔵グラフィック）" \
     "仮想環境  - VirtualBox・VMware 上で動かしている場合" \
     "インストールしない - よく分からない場合・後で手動設定")
 
   case "$gpu" in
-    "NVIDIA    - NVIDIA 製 GPU（GeForce など）※ゲーミング PC に多い") CONFIG[gpu_driver]="nvidia" ;;
-    "NVIDIA    - NVIDIA 製 GPU（オープンソース版 Nouveau）")            CONFIG[gpu_driver]="nouveau" ;;
+    "NVIDIA    - GTX 16xx / RTX 20xx 以降（公式ドライバ nvidia-open）")      CONFIG[gpu_driver]="nvidia" ;;
+    "NVIDIA    - GTX 10xx 以前・不明な場合（オープンソース版 Nouveau）")     CONFIG[gpu_driver]="nouveau" ;;
     "AMD       - AMD 製 GPU（Radeon など）")                            CONFIG[gpu_driver]="amdgpu" ;;
     "Intel     - Intel 内蔵グラフィックス（CPU 内蔵グラフィック）")     CONFIG[gpu_driver]="intel" ;;
     "仮想環境  - VirtualBox・VMware 上で動かしている場合")              CONFIG[gpu_driver]="virtual" ;;
@@ -1777,6 +1817,13 @@ step_fonts() {
   pkgs+=(ttf-fira-code)
   print_ok "ttf-fira-code を追加（固定）"
 
+  # Nerd Font のアイコン（記号だけのフォント）。
+  # starship のプロンプト記号（Linux アイコン等）は Nerd Font の私用領域の文字で、
+  # これが無いと ghostty（記号を内蔵している）以外のターミナルでは □ になる。
+  # 記号専用なので、既存の等幅フォントの見た目は変えずにフォールバックで効く。
+  pkgs+=(ttf-nerd-fonts-symbols-mono)
+  print_ok "ttf-nerd-fonts-symbols-mono（Nerd Font のアイコン）を追加（固定）"
+
   CONFIG[font_pkgs]="${pkgs[*]}"
   CONFIG[font_setup_fontconfig]="yes"
   echo ""
@@ -1998,9 +2045,13 @@ do_partition() {
   run_cmd "GPT テーブル初期化" sgdisk --zap-all "$disk"
 
   if [[ "$boot_mode" == "uefi" ]]; then
-    # EFI パーティション (512MB)
+    # EFI パーティション (1GB)
+    # 【重要】512MB にしないこと。systemd-boot はカーネルと initramfs（fallback 含む）を
+    # ESP に置くため、NVIDIA のモジュールを入れた initramfs や LTS カーネルの追加で
+    # 512MB では足りなくなり、カーネル更新が「空き容量不足」で失敗する。
+    # Arch の推奨も 1GB。
     run_cmd "EFI パーティション作成" \
-      sgdisk --new=1:0:+512M --typecode=1:ef00 --change-name=1:EFI "$disk"
+      sgdisk --new=1:0:+1G --typecode=1:ef00 --change-name=1:EFI "$disk"
 
     if [[ "$scheme" == "auto_swap" ]]; then
       # swap (RAM 同容量)
@@ -2170,6 +2221,24 @@ do_format_and_mount() {
 
       if confirm "Root パーティション ($root_p) を ${CONFIG[fs_type]:-ext4} でフォーマットしますか？（※既存データは消去されます）"; then
         _format_root "$root_p"
+      else
+        # 【重要】フォーマットしない場合は、既にあるファイルシステムに合わせること。
+        # CONFIG[fs_type] は手動モードでは尋ねていない既定値のままなので、
+        # そのまま mount -t に渡すと既存の ext4 を xfs としてマウントしようとして失敗する。
+        # btrfs の rootflags や mkinitcpio の設定もこの値を見るため、実体から決める。
+        local existing_fs
+        existing_fs=$(blkid -s TYPE -o value "$root_p" 2>/dev/null || true)
+        case "$existing_fs" in
+          ext4|btrfs|xfs)
+            CONFIG[fs_type]="$existing_fs"
+            print_ok "既存のファイルシステムを使用: ${existing_fs}"
+            ;;
+          *)
+            print_err "${root_p} のファイルシステム（${existing_fs:-なし}）には対応していません。"
+            print_err "ext4 / btrfs / xfs のいずれかでフォーマットしてください。"
+            exit 1
+            ;;
+        esac
       fi
       _mount_root "$root_p"
       CONFIG[root_part]="$root_p"
@@ -2231,7 +2300,13 @@ do_format_and_mount() {
     fi
 
     # 「別ターミナルで自分でマウントした」場合は CONFIG が空のままなので、
-    # 実際のマウント状態から root / swap を逆引きしておく。
+    # 実際のマウント状態から root / swap / ファイルシステムを逆引きしておく。
+    # ファイルシステムは btrfs の rootflags や mkinitcpio の設定が参照する。
+    local mounted_fs
+    mounted_fs=$(findmnt -no FSTYPE /mnt 2>/dev/null | head -n1 || true)
+    case "$mounted_fs" in
+      ext4|btrfs|xfs) CONFIG[fs_type]="$mounted_fs" ;;
+    esac
     # これを埋めておかないと resume フックとカーネルの resume= がズレる。
     if [[ -z "${CONFIG[root_part]}" ]]; then
       CONFIG[root_part]=$(findmnt -no SOURCE /mnt 2>/dev/null | head -n1 | sed 's/\[.*\]$//')
@@ -2594,9 +2669,13 @@ do_pacstrap() {
 
   # GPU ドライバーの追加
   case "${CONFIG[gpu_driver]}" in
-    nvidia)  pkgs+=(nvidia nvidia-utils) ;;
-    nouveau) pkgs+=(xf86-video-nouveau mesa) ;;
-    amdgpu)  pkgs+=(xf86-video-amdgpu mesa vulkan-radeon) ;;
+    # 【重要】nvidia ではなく nvidia-open。Arch は 2025年12月に公式パッケージを
+    # 置き換えた（_nvidia_generation のコメント参照）。対象は Turing 以降のみ。
+    nvidia)  pkgs+=(nvidia-open nvidia-utils) ;;
+    # xf86-video-* は X11 用。COSMIC は Wayland なので入れない
+    # （画面は mesa、Vulkan は各ベンダーのドライバが担当する）。
+    nouveau) pkgs+=(mesa vulkan-nouveau) ;;
+    amdgpu)  pkgs+=(mesa vulkan-radeon) ;;
     intel)
       # xf86-video-intel は X11 専用。COSMIC は Wayland なので不要。
       # intel-media-driver は動画のハードウェアデコード（VA-API, iHD）。
@@ -2605,7 +2684,7 @@ do_pacstrap() {
       pkgs+=(mesa vulkan-intel intel-media-driver)
       print_ok "Intel GPU (Wayland): mesa + vulkan-intel + intel-media-driver（xf86-video-intel はスキップ）"
       ;;
-    virtual) pkgs+=(xf86-video-vmware) ;;
+    virtual) pkgs+=(mesa) ;;
   esac
 
   # 仮想環境ゲストツールの追加
@@ -3387,7 +3466,7 @@ EOF"
     local ucode_line=""
     [[ -n "$ucode_initrd" ]] && ucode_line="${ucode_initrd}"$'\n'
     run_cmd "arch.conf エントリ作成" bash -c "mkdir -p /mnt/boot/loader/entries && cat > /mnt/boot/loader/entries/arch.conf << EOF
-title   Arch Linux
+title   ${OS_NAME}
 linux   /vmlinuz-linux
 ${ucode_line}initrd  /initramfs-linux.img
 options root=PARTUUID=${root_partuuid}${sb_rootflags} rw quiet${extra_options}
@@ -3395,7 +3474,7 @@ EOF"
 
     # フォールバックエントリ
     run_cmd "arch-fallback.conf 作成" bash -c "cat > /mnt/boot/loader/entries/arch-fallback.conf << EOF
-title   Arch Linux (fallback)
+title   ${OS_NAME} (fallback)
 linux   /vmlinuz-linux
 ${ucode_line}initrd  /initramfs-linux-fallback.img
 options root=PARTUUID=${root_partuuid}${sb_rootflags} rw${extra_options}
