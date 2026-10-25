@@ -3998,7 +3998,8 @@ _desktop_pkg_lists() {
   _dt_common+=(sddm)
 
   # 初心者向け推奨アプリ（unzip/git 等の軽量ツール。LibreOffice は選択制）
-  _dt_common+=(unzip p7zip wget curl git nano htop)
+  # 7zip: 本家 7-Zip。p7zip は旧名で、今は 7zip が引き継いでいる（provides）。
+  _dt_common+=(unzip 7zip wget curl git nano htop)
   # LibreOffice 本体 + 日本語言語パック(-ja)。本体だけだと UI が英語のままなので、
   # ロケールが日本語でも -ja を入れて初めて UI が日本語になる。
   if [[ "${CONFIG[install_office]:-no}" == "yes" ]]; then
