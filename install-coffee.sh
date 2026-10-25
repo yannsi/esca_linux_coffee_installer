@@ -1118,7 +1118,10 @@ tune_pacman_conf() {
   local conf="$1"
   [[ -f "$conf" ]] || return 0
   sed -i 's/^#Color$/Color/'                                                        "$conf"
-  sed -i 's/^#ParallelDownloads.*/ParallelDownloads = 10/'                           "$conf"
+  # 【重要】先頭の # を任意にすること。pacman 7 以降の pacman.conf は
+  # 「ParallelDownloads = 5」が最初から有効な状態で配布されるため、
+  # 「^#ParallelDownloads」だけを探すと一致せず、5 のまま変わらなかった。
+  sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 10/'                        "$conf"
   sed -i '/^#\[multilib\]/,/^#Include = \/etc\/pacman.d\/mirrorlist/s/^#//'        "$conf"
 }
 
@@ -1590,7 +1593,14 @@ step_users() {
     esac
 
     # 追加グループ
-    local ugroups="wheel,audio,video,storage,optical,input"
+    # 【重要】audio / storage / optical / input を付けないこと。
+    # 今の Arch では、音声・USB メモリ・光学ドライブ・入力機器の権限は
+    # systemd-logind がログイン中のセッションに自動で与える。
+    #   audio : セッションごとの権限管理をすり抜け、別ユーザーの音を奪える
+    #   input : 全キーボード入力を直接読める（キーロガーと同じ権限）
+    #   storage / optical : systemd 以前の名残で、今は何も追加されない
+    # video は brightnessctl など画面輝度の操作で使う場面があるため残す。
+    local ugroups="wheel,video"
 
     # リストに追記（区切り文字は | ）
     local entry="${uname}|${upw}|${usudo}|${ushell}|${ugroups}"
@@ -2182,6 +2192,35 @@ _mount_root() {
 # 実行: フォーマット & マウント
 # ============================================
 
+# ============================================
+# 手動パーティション時の EFI パーティション空き容量確認
+# ============================================
+# systemd-boot / GRUB（UEFI）とも、この構成では /boot = EFI パーティションに
+# カーネルと initramfs を置く。Windows が作った EFI パーティション（多くは
+# 100〜260MB）をそのまま使うと、インストールや後のカーネル更新が
+# 「空き容量不足」で失敗する。自動パーティションは 1GB で作るので対象外。
+_check_esp_space() {
+  local need=200 avail
+  # NVIDIA のモジュールを入れた initramfs は大きくなる
+  [[ "${CONFIG[gpu_driver]}" == "nvidia" ]] && need=400
+  avail=$(df -BM --output=avail /mnt/boot 2>/dev/null | tail -n1 | tr -dc '0-9') || true
+  [[ -n "$avail" ]] || return 0
+  if (( avail >= need )); then
+    print_ok "EFI パーティションの空き: ${avail}MiB"
+    return 0
+  fi
+  echo ""
+  print_warn "EFI パーティション（/boot）の空きが ${avail}MiB しかありません（目安: ${need}MiB 以上）。"
+  print_warn "カーネルと initramfs をここに置くため、容量不足で失敗するおそれがあります。"
+  print_warn "Windows が作った小さな EFI パーティションをそのまま使うと起こりがちです。"
+  echo "      対処の例: 空き領域に 1GB 程度の EFI パーティションを新しく作り、そちらを使う。"
+  echo ""
+  if ! confirm "このまま続けますか？"; then
+    print_err "中断しました。EFI パーティションを用意し直してから再実行してください。"
+    exit 1
+  fi
+}
+
 do_format_and_mount() {
   local disk="${CONFIG[disk]}"
   local scheme="${CONFIG[partition_scheme]}"
@@ -2297,6 +2336,9 @@ do_format_and_mount() {
     if [[ "$boot_mode" == "uefi" ]] && ! mountpoint -q /mnt/boot; then
       print_err "/mnt/boot がマウントされていません（UEFI には必須）。"
       exit 1
+    fi
+    if [[ "$boot_mode" == "uefi" ]]; then
+      _check_esp_space
     fi
 
     # 「別ターミナルで自分でマウントした」場合は CONFIG が空のままなので、
@@ -2530,21 +2572,17 @@ do_mirrorlist() {
 # 実行: ベースインストール
 # ============================================
 
-do_pacstrap() {
-  print_step "ベースシステムのインストール"
-
-  # pacman キーリング初期化（Live ISO では既に初期化済みの場合はスキップ）
-  if [[ ! -f /etc/pacman.d/gnupg/trustdb.gpg ]]; then
-    run_cmd "pacman キーリング初期化" pacman-key --init
-  else
-    print_ok "pacman キーリング初期化済み（スキップ）"
-  fi
-  run_cmd "Arch キーリング追加" pacman-key --populate archlinux
-  # Live ISOのキーリングを最新化（署名エラー防止）
-  # ※ この -Sy でパッケージDBも同時に更新されるため、追加の -Syy は不要
-  #   （-Syy は全ミラーDBの強制再取得で、直後に行うと単なる二重ダウンロードになる）
-  run_cmd_retry "Live ISO キーリング更新 + パッケージDB更新" pacman -Sy --noconfirm archlinux-keyring
-
+# ============================================
+# pacstrap で入れるパッケージ一覧を組み立てる
+# ============================================
+# do_pacstrap と、ディスク消去前の事前確認（_preflight_pkgs）の両方から使う。
+# 一覧を一箇所で組み立てることで、「確認したもの」と「実際に入れるもの」が
+# ずれないようにしている。
+# 引数1: 結果を入れる配列名 / 引数2: quiet なら案内を表示しない
+_collect_pacstrap_pkgs() {
+  local -n _out_ref="$1"
+  local _say=print_ok
+  [[ "${2:-}" == "quiet" ]] && _say=":"
   # 【重要】vim を入れても `vi` コマンドは使えない。
   # Arch は vi パッケージの提供を終了しており、vim パッケージは
   # /usr/bin/vi を作らないため、vi と打つと command not found になる。
@@ -2552,7 +2590,7 @@ do_pacstrap() {
   # 提供するので、これを併せて入れる。
   # （visudo や systemctl edit は EDITOR 未設定時に vi を呼ぶため、
   #   これが無いと編集そのものが起動しない場面がある）
-  local pkgs=(base sudo linux linux-firmware sof-firmware networkmanager vim ex-vi-compat)
+  local _ps=(base sudo linux linux-firmware sof-firmware networkmanager vim ex-vi-compat)
 
   # ファイルシステム操作ツール一式
   # GNOME Disks や KDE Partition Manager などの GUI は mkfs.* を外部コマンドとして
@@ -2575,35 +2613,35 @@ do_pacstrap() {
     mtools        # FAT をマウントせずに操作する
     parted        # パーティション操作（GUI ツールが libparted 経由で使う）
   )
-  pkgs+=("${fs_tools[@]}")
+  _ps+=("${fs_tools[@]}")
 
   # root のファイルシステムに応じた案内（パッケージ自体は上で導入済み）
   case "${CONFIG[fs_type]:-ext4}" in
-    btrfs) print_ok "root は Btrfs（btrfs-progs 導入済み）" ;;
-    xfs)   print_ok "root は XFS（xfsprogs 導入済み）" ;;
+    btrfs) "$_say" "root は Btrfs（btrfs-progs 導入済み）" ;;
+    xfs)   "$_say" "root は XFS（xfsprogs 導入済み）" ;;
   esac
 
   # WiFi バックエンド
   case "${CONFIG[wifi_backend]}" in
-    wpa_supplicant) pkgs+=(wpa_supplicant) ;;
-    iwd)            pkgs+=(iwd) ;;
+    wpa_supplicant) _ps+=(wpa_supplicant) ;;
+    iwd)            _ps+=(iwd) ;;
   esac
 
   # マイクロコード
   local cpu_vendor="${CONFIG[cpu_vendor]}"
   if [[ "$cpu_vendor" == "GenuineIntel" ]]; then
-    pkgs+=(intel-ucode)
-    print_ok "Intel マイクロコードを追加"
+    _ps+=(intel-ucode)
+    "$_say" "Intel マイクロコードを追加"
   elif [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
-    pkgs+=(amd-ucode)
-    print_ok "AMD マイクロコードを追加"
+    _ps+=(amd-ucode)
+    "$_say" "AMD マイクロコードを追加"
   fi
 
   # コンソール（TTY）フォント。
   # 既定の 8x16 フォントは高解像度パネルだと極端に小さく読みにくい。
   # また X / Wayland が起動しない障害時に TTY だけが復旧手段になるため、
   # デスクトップの有無に関わらず全インストールで入れておく。
-  pkgs+=(terminus-font)
+  _ps+=(terminus-font)
 
   # starship プロンプト（全インストール共通）。
   # 【重要】do_desktop 側ではなくここで入れること。
@@ -2611,7 +2649,7 @@ do_pacstrap() {
   # CLI のみの構成でプロンプト初期化だけが .bashrc に残り、
   # シェルを開くたびに starship が見つからない状態になる
   # （init 側は command -v で守ってあるが、本体が無いこと自体が想定外）。
-  pkgs+=(starship)
+  _ps+=(starship)
 
   # 汎用 CLI ツール（全インストール共通）。
   # 【重要】starship と同じ理由で do_desktop 側ではなくここに置くこと。
@@ -2619,11 +2657,11 @@ do_pacstrap() {
   # CLI のみの構成にだけ入らない。これらはターミナルから使う道具なので、
   # デスクトップ環境の有無で入る／入らないが変わるのは筋が通らない。
   #
-  # かつて streamlink を Hyprland / Niri の pkgs にだけ置いていた時期があり、
+  # かつて streamlink を Hyprland / Niri の _ps にだけ置いていた時期があり、
   # 「GNOME に streamlink が入らない」という取りこぼしが実際に起きた。
   # 特定の WM やパネルの依存として扱わず、必ずこの一箇所で管理する。
   # 5つとも公式リポジトリ (extra) にあるため AUR ヘルパーは不要。
-  pkgs+=(
+  _ps+=(
     streamlink      # 各種配信サイトのストリーム取得（mpv へ引き渡し）
     yt-dlp          # 動画・音声のダウンロード
     sox             # 音声の変換・加工・再生 (play/rec/sox)
@@ -2633,25 +2671,25 @@ do_pacstrap() {
 
   # ユーザーのログインシェル（zsh / fish）を自動追加
   if [[ "${CONFIG[users]:-}" =~ \|zsh\| ]]; then
-    pkgs+=(zsh)
-    print_ok "ログインシェル用 zsh を追加"
+    _ps+=(zsh)
+    "$_say" "ログインシェル用 zsh を追加"
   fi
   if [[ "${CONFIG[users]:-}" =~ \|fish\| ]]; then
-    pkgs+=(fish)
-    print_ok "ログインシェル用 fish を追加"
+    _ps+=(fish)
+    "$_say" "ログインシェル用 fish を追加"
   fi
 
   # GRUB 選択時は追加パッケージ
   if [[ "${CONFIG[bootloader]}" == "grub" ]]; then
-    pkgs+=(grub)
+    _ps+=(grub)
     if [[ "${CONFIG[boot_mode]}" == "uefi" ]]; then
-      pkgs+=(efibootmgr)
+      _ps+=(efibootmgr)
     fi
     # Windows を検出したときは他OS検出のため os-prober を追加
     # （NTFS のマウントに必要な ntfs-3g は fs_tools で導入済み）
     if [[ "${CONFIG[windows_found]}" == "yes" ]]; then
-      pkgs+=(os-prober)
-      print_ok "Windows 検出のため os-prober を追加"
+      _ps+=(os-prober)
+      "$_say" "Windows 検出のため os-prober を追加"
     fi
   fi
 
@@ -2660,38 +2698,38 @@ do_pacstrap() {
   # git が無いとこの確認が失敗し、「AUR に接続できません／DNS の同期不良」という
   # 実態と異なる警告を出したまま処理が進む。
   if [[ "${CONFIG[aur_helper]}" != "none" || "${CONFIG[install_chrome]:-no}" == "yes" || "${CONFIG[install_ytfzf]:-no}" == "yes" ]]; then
-    pkgs+=(git)
+    _ps+=(git)
   fi
 
   # OpenSSH, UFW の追加
-  [[ "${CONFIG[extra_ssh]}" == "yes" ]] && pkgs+=(openssh)
-  [[ "${CONFIG[extra_ufw]}" == "yes" ]] && pkgs+=(ufw)
+  [[ "${CONFIG[extra_ssh]}" == "yes" ]] && _ps+=(openssh)
+  [[ "${CONFIG[extra_ufw]}" == "yes" ]] && _ps+=(ufw)
 
   # GPU ドライバーの追加
   case "${CONFIG[gpu_driver]}" in
     # 【重要】nvidia ではなく nvidia-open。Arch は 2025年12月に公式パッケージを
     # 置き換えた（_nvidia_generation のコメント参照）。対象は Turing 以降のみ。
-    nvidia)  pkgs+=(nvidia-open nvidia-utils) ;;
+    nvidia)  _ps+=(nvidia-open nvidia-utils) ;;
     # xf86-video-* は X11 用。COSMIC は Wayland なので入れない
     # （画面は mesa、Vulkan は各ベンダーのドライバが担当する）。
-    nouveau) pkgs+=(mesa vulkan-nouveau) ;;
-    amdgpu)  pkgs+=(mesa vulkan-radeon) ;;
+    nouveau) _ps+=(mesa vulkan-nouveau) ;;
+    amdgpu)  _ps+=(mesa vulkan-radeon) ;;
     intel)
       # xf86-video-intel は X11 専用。COSMIC は Wayland なので不要。
       # intel-media-driver は動画のハードウェアデコード（VA-API, iHD）。
       # Broadwell（第5世代 Core）以降が対象で、これが無いと Firefox や mpv の
       # 動画再生が CPU デコードになり、負荷とバッテリー消費が大きく増える。
-      pkgs+=(mesa vulkan-intel intel-media-driver)
-      print_ok "Intel GPU (Wayland): mesa + vulkan-intel + intel-media-driver（xf86-video-intel はスキップ）"
+      _ps+=(mesa vulkan-intel intel-media-driver)
+      "$_say" "Intel GPU (Wayland): mesa + vulkan-intel + intel-media-driver（xf86-video-intel はスキップ）"
       ;;
-    virtual) pkgs+=(mesa) ;;
+    virtual) _ps+=(mesa) ;;
   esac
 
   # 仮想環境ゲストツールの追加
   case "${CONFIG[virt_env]}" in
-    oracle)             pkgs+=(virtualbox-guest-utils) ;;
-    kvm|qemu)           pkgs+=(qemu-guest-agent) ;;
-    vmware)             pkgs+=(open-vm-tools) ;;
+    oracle)             _ps+=(virtualbox-guest-utils) ;;
+    kvm|qemu)           _ps+=(qemu-guest-agent) ;;
+    vmware)             _ps+=(open-vm-tools) ;;
   esac
 
   # ユーザーが選択した追加パッケージ
@@ -2700,30 +2738,51 @@ do_pacstrap() {
         || "${CONFIG[aur_helper]}" != "none" \
         || "${CONFIG[install_chrome]:-no}" == "yes" \
         || "${CONFIG[install_ytfzf]:-no}" == "yes" ]]; then
-    pkgs+=(base-devel)
+    _ps+=(base-devel)
   fi
-  [[ "${CONFIG[extra_zram]}" == "yes" ]]       && pkgs+=(zram-generator)
+  [[ "${CONFIG[extra_zram]}" == "yes" ]]       && _ps+=(zram-generator)
   if [[ -n "${CONFIG[extra_pkgs]}" ]]; then
     read -ra _extra <<< "${CONFIG[extra_pkgs]}"
-    pkgs+=("${_extra[@]}")
+    _ps+=("${_extra[@]}")
   fi
 
   # フォント
   if [[ -n "${CONFIG[font_pkgs]}" ]]; then
     read -ra _font_pkgs <<< "${CONFIG[font_pkgs]}"
-    pkgs+=("${_font_pkgs[@]}")
+    _ps+=("${_font_pkgs[@]}")
   fi
 
   # 日本語環境が有効なのに CJK フォントが無い場合、文字化け（豆腐）を防ぐため
   # 最低限の日本語・絵文字フォントを自動追加する（初心者救済のセーフティネット）
   if [[ "${CONFIG[japanese_env]}" == "yes" ]]; then
-    [[ " ${pkgs[*]} " == *" noto-fonts-cjk "* ]]   || { pkgs+=(noto-fonts-cjk);   print_ok "日本語表示のため noto-fonts-cjk を自動追加（豆腐防止）"; }
-    [[ " ${pkgs[*]} " == *" noto-fonts "* ]]       || pkgs+=(noto-fonts)
-    [[ " ${pkgs[*]} " == *" noto-fonts-emoji "* ]] || pkgs+=(noto-fonts-emoji)
+    [[ " ${_ps[*]} " == *" noto-fonts-cjk "* ]]   || { _ps+=(noto-fonts-cjk);   "$_say" "日本語表示のため noto-fonts-cjk を自動追加（豆腐防止）"; }
+    [[ " ${_ps[*]} " == *" noto-fonts "* ]]       || _ps+=(noto-fonts)
+    [[ " ${_ps[*]} " == *" noto-fonts-emoji "* ]] || _ps+=(noto-fonts-emoji)
   fi
 
   # IME（日本語特化のため fcitx5-mozc に固定）
-  pkgs+=(fcitx5 fcitx5-mozc fcitx5-gtk fcitx5-qt fcitx5-configtool)
+  _ps+=(fcitx5 fcitx5-mozc fcitx5-gtk fcitx5-qt fcitx5-configtool)
+
+  _out_ref=("${_ps[@]}")
+}
+
+do_pacstrap() {
+  print_step "ベースシステムのインストール"
+
+  # pacman キーリング初期化（Live ISO では既に初期化済みの場合はスキップ）
+  if [[ ! -f /etc/pacman.d/gnupg/trustdb.gpg ]]; then
+    run_cmd "pacman キーリング初期化" pacman-key --init
+  else
+    print_ok "pacman キーリング初期化済み（スキップ）"
+  fi
+  run_cmd "Arch キーリング追加" pacman-key --populate archlinux
+  # Live ISOのキーリングを最新化（署名エラー防止）
+  # ※ この -Sy でパッケージDBも同時に更新されるため、追加の -Syy は不要
+  #   （-Syy は全ミラーDBの強制再取得で、直後に行うと単なる二重ダウンロードになる）
+  run_cmd_retry "Live ISO キーリング更新 + パッケージDB更新" pacman -Sy --noconfirm archlinux-keyring
+
+  local pkgs=()
+  _collect_pacstrap_pkgs pkgs
 
   # 【重要】FONT は KEYMAP と同じ /etc/vconsole.conf に書く。
   # 以前は KEYMAP 行だけを `>` で書き出していたため、ここで FONT を
@@ -2848,17 +2907,20 @@ do_chroot_config() {
     systemctl --root=/mnt enable systemd-timesyncd
 
   # 日本向け NTP サーバーを設定
+  # 【重要】/etc/systemd/timesyncd.conf（パッケージ所有）を上書きせず、
+  # timesyncd.conf.d/ のドロップインに書くこと。本体を書き換えると、
+  # systemd の更新のたびに .pacnew が残って差分の確認が必要になる。
   if [[ "${CONFIG[timezone]}" == Asia/Tokyo* || "${CONFIG[timezone]}" == Asia/Osaka* ]]; then
-    run_cmd "NTP サーバー設定（日本）" bash -c "mkdir -p /mnt/etc/systemd && \
-      cat > /mnt/etc/systemd/timesyncd.conf << 'EOF'
+    run_cmd "NTP サーバー設定（日本）" bash -c "mkdir -p /mnt/etc/systemd/timesyncd.conf.d && \
+      cat > /mnt/etc/systemd/timesyncd.conf.d/10-esca.conf << 'EOF'
 [Time]
 NTP=ntp.nict.go.jp 0.jp.pool.ntp.org 1.jp.pool.ntp.org
 FallbackNTP=0.arch.pool.ntp.org 1.arch.pool.ntp.org
 EOF"
     print_ok "NTP: nict.go.jp（国立研究開発法人情報通信研究機構）"
   else
-    run_cmd "NTP サーバー設定（デフォルト）" bash -c "mkdir -p /mnt/etc/systemd && \
-      cat > /mnt/etc/systemd/timesyncd.conf << 'EOF'
+    run_cmd "NTP サーバー設定（デフォルト）" bash -c "mkdir -p /mnt/etc/systemd/timesyncd.conf.d && \
+      cat > /mnt/etc/systemd/timesyncd.conf.d/10-esca.conf << 'EOF'
 [Time]
 NTP=0.arch.pool.ntp.org 1.arch.pool.ntp.org 2.arch.pool.ntp.org
 FallbackNTP=0.pool.ntp.org 1.pool.ntp.org
@@ -3460,12 +3522,25 @@ EOF"
     fi
 
     # マイクロコードの initrd を判定
+    # 【重要】mkinitcpio の HOOKS に microcode があるときは、別の initrd 行を書かないこと。
+    # mkinitcpio v38 以降は microcode フックで initramfs 本体にマイクロコードを
+    # 同梱するため、別行は二重読み込みになるだけ。さらに Arch では
+    # /boot/*-ucode.img の配布をやめる提案が出ており、実現すると
+    # 存在しないファイルを指すこの行のせいで起動できなくなる。
+    # フックが無い（利用者が外した等）ときだけ、従来どおり別行で読み込む。
     local ucode_initrd=""
     local cpu_vendor="${CONFIG[cpu_vendor]}"
-    if [[ "$cpu_vendor" == "GenuineIntel" ]]; then
-      ucode_initrd="initrd  /intel-ucode.img"
-    elif [[ "$cpu_vendor" == "AuthenticAMD" ]]; then
-      ucode_initrd="initrd  /amd-ucode.img"
+    local has_ucode_hook="no"
+    if [[ "${CONFIG[dry_run]}" == "yes" ]] \
+       || grep -Eq '^[[:space:]]*HOOKS=.*[( ]microcode[ )]' /mnt/etc/mkinitcpio.conf 2>/dev/null; then
+      has_ucode_hook="yes"
+    fi
+    if [[ "$has_ucode_hook" != "yes" ]]; then
+      if [[ "$cpu_vendor" == "GenuineIntel" && -f /mnt/boot/intel-ucode.img ]]; then
+        ucode_initrd="initrd  /intel-ucode.img"
+      elif [[ "$cpu_vendor" == "AuthenticAMD" && -f /mnt/boot/amd-ucode.img ]]; then
+        ucode_initrd="initrd  /amd-ucode.img"
+      fi
     fi
 
     # エントリファイル作成（ucode が空の場合は空行を入れない）
@@ -3540,32 +3615,80 @@ EOF"
 # 任意の git リポジトリを clone → makepkg -si する（ユーザー権限・ホーム内・単一セッション）。
 # 成功=0 / 失敗=1（非致命的）。呼び出し側で一時 NOPASSWD sudo を用意しておくこと。
 # 引数: 1=ユーザー名 2=git URL 3=クローン先ディレクトリ名 4=表示ラベル（省略時は3）
+#       5=ダウンロード元として許可する URL の正規表現（省略時は確認しない）
+#
+# 【安全確認】2026年6月、放置された AUR パッケージが大量に乗っ取られ、
+# ビルド手順に情報窃取マルウェアを仕込まれる事件が起きた（1,500件超）。
+# このインストーラーは PKGBUILD を人が読まないまま、一時 NOPASSWD sudo 付きで
+# ビルドするため、ビルド前に次の2点を機械的に確かめる。
+#   1. ダウンロード元（source）が、そのパッケージ本来の配布元だけであること
+#      （yay-bin なら github.com/Jguer/yay、Chrome なら dl.google.com）
+#   2. 事件で使われた種類の命令（npm / bun / pip でのインストール、
+#      curl ... | sh、base64 デコード）が PKGBUILD や .install に無いこと
+# どちらかに引っかかったらビルドせずにスキップする（インストール自体は続行）。
+# 版を固定する方式は採らない。Chrome は古い版の .deb が配布元から消えるため、
+# 固定するとすぐにビルドできなくなる。
+#
+# 【重要】URL などは bash -c の文字列に埋め込まず、位置引数で渡すこと。
+# 正規表現の \ や | がクォートを壊すため。
 _makepkg_git_install() {
-  local user="$1" giturl="$2" dir="$3" label="${4:-$3}"
+  local user="$1" giturl="$2" dir="$3" label="${4:-$3}" allow="${5:-}"
+  local rc=0 log_before
+  # 安全確認の判定は「今回のビルドで増えたログ」だけを見る（前のビルドの記録を拾わない）
+  log_before=$(wc -l < "${CONFIG[log_file]}" 2>/dev/null) || log_before=0
   run_cmd_soft "${label} のビルド & インストール（ユーザー: ${user}）" \
     arch-chroot /mnt sudo -u "${user}" -H bash -c '
       set -e
+      dir="$1" giturl="$2" allow="$3"
       # 隠しディレクトリを使い、ホーム直下に見えるフォルダを残さない
       bd="$HOME/.cache/aur-build"; mkdir -p "$bd"; cd "$bd"
       for i in 1 2 3; do
-        rm -rf "'"${dir}"'"
-        git clone --depth=1 "'"${giturl}"'" "'"${dir}"'" && break
+        rm -rf "$dir"
+        git clone --depth=1 "$giturl" "$dir" && break
         echo "git clone に失敗、リトライ ($i/3)"; sleep 5
         [ "$i" = 3 ] && exit 1
       done
-      cd "'"${dir}"'"
+      cd "$dir"
+
+      if [ -n "$allow" ]; then
+        # .SRCINFO はただのテキストなので、PKGBUILD を実行せずに source を読める。
+        # （makepkg --printsrcinfo は PKGBUILD を読み込む＝中のコードが動くため使わない）
+        if [ ! -f .SRCINFO ]; then
+          echo "【安全確認】.SRCINFO が無いため、ダウンロード元を確認できません"
+          exit 3
+        fi
+        bad=$(sed -n "s/^[[:space:]]*source[^=]*= //p" .SRCINFO \
+                | sed "s/^[^:]*:://" | grep "://" | grep -Ev "$allow" || true)
+        if [ -n "$bad" ]; then
+          echo "【安全確認】想定外のダウンロード元があるためビルドしません:"
+          echo "$bad"
+          exit 3
+        fi
+      fi
+      if grep -Eqs -- "(npm|pnpm|yarn|bun)[[:space:]]+(i|install|add)([[:space:]]|$)|pip[0-9.]*[[:space:]]+install|(curl|wget)[^|]*[|][[:space:]]*(ba|z)?sh|base64[[:space:]]+(-d|--decode)" \
+           PKGBUILD ./*.install; then
+        echo "【安全確認】PKGBUILD に不審な命令があるためビルドしません"
+        exit 3
+      fi
+
       makepkg -si --noconfirm --needed
       # ビルドディレクトリと、空になった作業用の親ディレクトリを削除する
-      cd "$HOME"; rm -rf "$bd/'"${dir}"'"
+      cd "$HOME"; rm -rf "${bd:?}/$dir"
       rmdir "$bd" 2>/dev/null || true
-    '
+    ' _ "$dir" "$giturl" "$allow" || rc=$?
+  if [[ "$rc" -ne 0 ]] \
+     && tail -n +"$(( log_before + 1 ))" "${CONFIG[log_file]}" 2>/dev/null | grep -q '【安全確認】'; then
+    print_warn "${label}: 安全確認に引っかかったためビルドしませんでした（詳細はログの「安全確認」）"
+  fi
+  return "$rc"
 }
 
 # AUR パッケージ1つをビルド&インストール（_makepkg_git_install の AUR 版ラッパー）。
 # 引数1: ユーザー名, 引数2: AUR リポジトリ名（=パッケージ名）
+# 引数3: ダウンロード元として許可する URL の正規表現（_makepkg_git_install 参照）
 _aur_makepkg_install() {
-  local user="$1" repo="$2"
-  _makepkg_git_install "$user" "https://aur.archlinux.org/${repo}.git" "$repo" "$repo"
+  local user="$1" repo="$2" allow="${3:-}"
+  _makepkg_git_install "$user" "https://aur.archlinux.org/${repo}.git" "$repo" "$repo" "$allow"
 }
 
 # AUR/Chrome が入らなかった場合の手動導入手順を表示
@@ -3643,7 +3766,7 @@ do_aur_helper() {
   if [[ "$helper" != "none" && "$aur_ok" == "yes" ]]; then
     local repo_name="$helper"
     [[ "$helper" == "yay" ]] && repo_name="yay-bin"
-    if _aur_makepkg_install "$first_user" "$repo_name"; then
+    if _aur_makepkg_install "$first_user" "$repo_name" '^https://github\.com/Jguer/yay/'; then
       print_ok "${helper} をインストールしました（今後の AUR は「${helper} -S <名前>」で導入可）"
     else
       print_warn "${helper} のインストールに失敗しました（スキップして継続）"
@@ -3653,7 +3776,7 @@ do_aur_helper() {
   # ── 2) Google Chrome（yay に依存せず AUR から直接ビルド）──
   # google-chrome の依存は公式リポジトリのみのため、makepkg -si 単体で完結する。
   if [[ "$want_chrome" == "yes" && "$aur_ok" == "yes" ]]; then
-    if _aur_makepkg_install "$first_user" "google-chrome"; then
+    if _aur_makepkg_install "$first_user" "google-chrome" '^https://dl\.google\.com/'; then
       print_ok "Google Chrome をインストールしました"
     else
       print_warn "Google Chrome のインストールに失敗しました（後から makepkg で導入できます）"
@@ -3664,6 +3787,7 @@ do_aur_helper() {
   # fzf/yt-dlp を使う対話的 YouTube ダウンローダ/再生ツール。
   # 依存(fzf, yt-dlp, mpv, ffmpeg)は makepkg -si が公式リポジトリから自動導入する。
   if [[ "$want_ytfzf" == "yes" ]]; then
+    # 自分のリポジトリなので .SRCINFO による配布元の確認はしない（不審な命令の確認は行う）
     if _makepkg_git_install "$first_user" \
          "https://github.com/yannsi/yt-fzf-sh" "yt-fzf-sh" "yt-fzf-sh (YouTube ツール)"; then
       print_ok "yt-fzf-sh をインストールしました（コマンド: ${BOLD}yt-fzf${RESET}）"
@@ -3823,25 +3947,15 @@ write_libreoffice_cosmic_launchers() {
 # 実行: デスクトップ環境
 # ============================================
 
-do_desktop() {
-  # STEP_TOTAL に計上済みのため、スキップ時もステップ表示を先に行う
-  # （早期 return より前に print_step しないと [n/N] の番号がずれる）
-  print_step "デスクトップ環境のインストール: COSMIC"
-
-  # dry_run 時は /mnt がマウントされていないためスキップ
-  if [[ "${CONFIG[dry_run]}" == "yes" ]]; then
-    print_warn "ドライランのためデスクトップ環境のセットアップをスキップします"
-    return 0
-  fi
-
-  # pipewire-jack と jack2 の競合を事前に回避
-  if arch-chroot /mnt pacman -Qi jack2 &>/dev/null; then
-    run_cmd "jack2 の一時削除 (pipewire-jack 競合回避)" \
-      arch-chroot /mnt pacman -Rdd --noconfirm jack2
-  fi
-
+# ============================================
+# デスクトップ導入で入れるパッケージ一覧を組み立てる
+# ============================================
+# do_desktop と、ディスク消去前の事前確認（_preflight_pkgs）の両方から使う。
+# 引数1: 共通パッケージを入れる配列名 / 引数2: COSMIC 本体のパッケージを入れる配列名
+_desktop_pkg_lists() {
+  local -n _common_out="$1" _de_out="$2"
   # 音声・Bluetooth・ファイルシステム・マルチメディア・ブラウザなどのデスクトップ共通パッケージ
-  local desktop_common_pkgs=(
+  local _dt_common=(
     pipewire pipewire-pulse wireplumber
     pipewire-alsa pipewire-jack libldac
     bluez bluez-utils
@@ -3881,27 +3995,54 @@ do_desktop() {
   # ── トランザクション統合 ──
   # SDDM と推奨アプリを COSMIC 本体と同一の pacman 実行にまとめ、
   # 依存解決とフォントキャッシュ再生成などのフック実行の重複を減らす（時間短縮）
-  desktop_common_pkgs+=(sddm)
+  _dt_common+=(sddm)
 
   # 初心者向け推奨アプリ（unzip/git 等の軽量ツール。LibreOffice は選択制）
-  desktop_common_pkgs+=(unzip p7zip wget curl git nano htop)
+  _dt_common+=(unzip p7zip wget curl git nano htop)
   # LibreOffice 本体 + 日本語言語パック(-ja)。本体だけだと UI が英語のままなので、
   # ロケールが日本語でも -ja を入れて初めて UI が日本語になる。
   if [[ "${CONFIG[install_office]:-no}" == "yes" ]]; then
-    desktop_common_pkgs+=(libreoffice-fresh)
-    [[ "${CONFIG[japanese_env]}" == "yes" ]] && desktop_common_pkgs+=(libreoffice-fresh-ja)
+    _dt_common+=(libreoffice-fresh)
+    [[ "${CONFIG[japanese_env]}" == "yes" ]] && _dt_common+=(libreoffice-fresh-ja)
   fi
   # 【重要】firefox 本体も明示して入れること。
   # firefox-i18n-ja は firefox を依存に持つので本体自体は入るが、依存として
   # 入るだけだと pacman -Qdt に孤児候補として並び、言語パックを消すと本体まで
   # 一緒に消える。明示インストールにしておけば独立して残る。
-  [[ "${CONFIG[japanese_env]}" == "yes" ]] && desktop_common_pkgs+=(firefox firefox-i18n-ja)
+  [[ "${CONFIG[japanese_env]}" == "yes" ]] && _dt_common+=(firefox firefox-i18n-ja)
 
   # ── COSMIC 本体 ──
   # coffee版: 既定ターミナルを ghostty に一本化するため、cosmic 本体と
   # 一緒に導入する（cosmic-term はグループの依存関係として残るが、
   # ショートカット/パネルからは ghostty を使うよう下で明示的に設定する）。
-  local pkgs=(cosmic ghostty)
+  local _dt_pkgs=(cosmic ghostty)
+
+  _common_out=("${_dt_common[@]}")
+  _de_out=("${_dt_pkgs[@]}")
+}
+
+do_desktop() {
+  # STEP_TOTAL に計上済みのため、スキップ時もステップ表示を先に行う
+  # （早期 return より前に print_step しないと [n/N] の番号がずれる）
+  print_step "デスクトップ環境のインストール: COSMIC"
+
+  # dry_run 時は /mnt がマウントされていないためスキップ
+  if [[ "${CONFIG[dry_run]}" == "yes" ]]; then
+    print_warn "ドライランのためデスクトップ環境のセットアップをスキップします"
+    return 0
+  fi
+
+  # pipewire-jack と jack2 の競合を事前に回避
+  if arch-chroot /mnt pacman -Qi jack2 &>/dev/null; then
+    run_cmd "jack2 の一時削除 (pipewire-jack 競合回避)" \
+      arch-chroot /mnt pacman -Rdd --noconfirm jack2
+  fi
+
+  # パッケージ一覧は _desktop_pkg_lists で組み立てる。
+  # ディスク消去前の事前確認（_preflight_pkgs）と同じ一覧を使うため、
+  # ここに直接パッケージ名を書き足さないこと。
+  local desktop_common_pkgs=() pkgs=()
+  _desktop_pkg_lists desktop_common_pkgs pkgs
   run_cmd_retry "COSMIC インストール" \
     arch-chroot /mnt pacman -S --noconfirm --needed "${pkgs[@]}" "${desktop_common_pkgs[@]}"
   # COSMIC のシェル(cosmic-text)は /etc/fonts/conf.d の locale ルールを読まず、
@@ -4886,6 +5027,61 @@ do_cleanup() {
 # インストール実行
 # ============================================
 
+# ============================================
+# ディスク消去前のパッケージ名確認
+# ============================================
+# これから入れる公式パッケージ（pacstrap 分とデスクトップ分）が、すべて
+# リポジトリに存在するかを、ディスクに触る前に一括で確かめる。
+#
+# 【経緯】Arch では名前変更が時々起きる（2025年12月の nvidia → nvidia-open など）。
+# 以前は pacstrap の時点で初めて「target not found」になり、ディスクを
+# 消した後で止まっていた。ここで止めれば、ディスクは無傷のまま中断できる。
+#
+# 判定は pacman -Sp（何も書き換えず、入れる予定のファイル一覧を出すだけ）。
+# 「見つからない」以外の理由（依存の衝突など）で失敗した場合は、ここでは止めず
+# 警告だけ出す。本番の pacman は --needed や個別の対処で通ることがあるため。
+_preflight_pkgs() {
+  local desc="パッケージ名の事前確認（ディスク消去前）"
+  local base=() common=() de=() all=()
+  _collect_pacstrap_pkgs base quiet
+  _desktop_pkg_lists common de
+  all=("${base[@]}" "${de[@]}" "${common[@]}")
+
+  # パッケージ DB の用意。ドライランでは DB を更新せず、手元にあるものだけで確かめる。
+  if [[ "${CONFIG[dry_run]}" == "yes" ]]; then
+    if [[ ! -f /var/lib/pacman/sync/core.db ]]; then
+      print_warn "${desc}: パッケージ情報が無いため省略します（ドライラン）"
+      return 0
+    fi
+  elif ! pacman -Sy --noconfirm >> "${CONFIG[log_file]}" 2>&1; then
+    print_warn "${desc}: パッケージ情報を取得できないため省略します"
+    return 0
+  fi
+
+  echo -ne "  ${CYAN}…${RESET} ${desc}..."
+  local out rc=0
+  # 【重要】LC_ALL=C を付けること。日本語環境のホストから実行すると
+  # pacman のエラーが日本語になり、「target not found」を拾えなくなる。
+  out=$(LC_ALL=C pacman -Sp --noconfirm --print-format '%n' -- "${all[@]}" 2>&1 >/dev/null < /dev/null) || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    echo -e "\r  ${GREEN}✔${RESET} ${desc}（${#all[@]}件）                              "
+    return 0
+  fi
+
+  { echo "--- ${desc} ---"; echo "$out"; } >> "${CONFIG[log_file]}"
+  local missing
+  missing=$(grep -oE 'target not found: [^ ]+' <<< "$out" | awk '{print $4}' | sort -u | tr '\n' ' ') || true
+  if [[ -n "$missing" ]]; then
+    echo -e "\r  ${RED}✘${RESET} ${desc} — 見つからないパッケージがあります                              "
+    print_err "公式リポジトリに見つかりません: ${missing}"
+    print_err "名前が変わったか、提供が終わった可能性があります。"
+    print_err "ディスクにはまだ何も書き込んでいません。インストーラーを更新してから再実行してください。"
+    exit 1
+  fi
+  echo -e "\r  ${YELLOW}⚠${RESET} ${desc} — 確認できない項目があります（続行）                              "
+  print_warn "パッケージの事前確認で問題が出ました（詳細はログ）。インストールは続行します。"
+}
+
 run_install() {
   clear
   echo ""
@@ -4907,18 +5103,21 @@ run_install() {
     && STEP_TOTAL=$(( STEP_TOTAL + 1 ))
 
   # ファイルシステム固有ツールの確認（選択確定後にインストール）
-  case "${CONFIG[fs_type]:-ext4}" in
-    btrfs)
-      if ! command -v mkfs.btrfs &>/dev/null; then
-        print_warn "btrfs-progs をインストールします..."
-        pacman -S --noconfirm btrfs-progs || { print_err "btrfs-progs のインストールに失敗しました。"; exit 1; }
-      fi ;;
-    xfs)
-      if ! command -v mkfs.xfs &>/dev/null; then
-        print_warn "xfsprogs をインストールします..."
-        pacman -S --noconfirm xfsprogs || { print_err "xfsprogs のインストールに失敗しました。"; exit 1; }
-      fi ;;
-  esac
+  # 【重要】ドライランでは何も入れないこと（「変更は適用されません」と食い違う）
+  if [[ "${CONFIG[dry_run]}" != "yes" ]]; then
+    case "${CONFIG[fs_type]:-ext4}" in
+      btrfs)
+        if ! command -v mkfs.btrfs &>/dev/null; then
+          print_warn "btrfs-progs をインストールします..."
+          pacman -S --noconfirm btrfs-progs || { print_err "btrfs-progs のインストールに失敗しました。"; exit 1; }
+        fi ;;
+      xfs)
+        if ! command -v mkfs.xfs &>/dev/null; then
+          print_warn "xfsprogs をインストールします..."
+          pacman -S --noconfirm xfsprogs || { print_err "xfsprogs のインストールに失敗しました。"; exit 1; }
+        fi ;;
+    esac
+  fi
 
   if [[ "${CONFIG[dry_run]}" != "yes" ]]; then
     echo "" > "${CONFIG[log_file]}"
@@ -4939,6 +5138,8 @@ run_install() {
   # ディスクには触れない。一方ネットワーク次第で失敗しうる処理なので、
   # 消去の後に置くと「ディスクは空になったのにインストールできない」状態で止まる。
   do_mirrorlist
+  # 【重要】ディスクを消す do_partition より前に置くこと（理由は _preflight_pkgs 参照）
+  _preflight_pkgs
   do_partition
   do_format_and_mount
   do_pacstrap
@@ -5175,7 +5376,13 @@ main() {
   fi
 
   echo ""
-  print_warn "この操作は取り消せません。ディスク ${CONFIG[disk]} の全データが完全に消去されます。"
+  # 【重要】手動パーティションでは全消去しない。ここで「全データが消去されます」と
+  # 出すと、Windows と共存させたい人が中断してしまう（または逆に慣れて読み飛ばす）。
+  if [[ "${CONFIG[partition_scheme]}" == "manual" ]]; then
+    print_warn "この操作は取り消せません。フォーマットを選んだパーティションのデータは消去されます。"
+  else
+    print_warn "この操作は取り消せません。ディスク ${CONFIG[disk]} の全データが完全に消去されます。"
+  fi
   local final_confirm
   local tty_out tty_in; _resolve_tty tty_out tty_in
   echo -ne "  ${BOLD}${RED}実行する場合は大文字で YES と入力してください${RESET}: " > "$tty_out"
@@ -5187,4 +5394,8 @@ main() {
   run_install
 }
 
-main "$@"
+# テストから関数だけを読み込めるよう、直接実行されたときだけ main を呼ぶ
+# （source install-coffee.sh では何も実行されない。install.sh と同じ方式）
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
