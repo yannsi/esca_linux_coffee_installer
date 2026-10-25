@@ -24,7 +24,7 @@ jobs:
 
       - name: 構文チェック (bash -n)
         run: |
-          for f in *.sh; do
+          for f in *.sh tests/*.sh; do
             echo "== $f"
             bash -n "$f"
           done
@@ -33,3 +33,4 @@ jobs:
         run: |
           shellcheck --version
           shellcheck -S warning ./*.sh
+          shellcheck -x -P SCRIPTDIR -S warning tests/*.sh

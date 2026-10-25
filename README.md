@@ -159,3 +159,5 @@ ESCA_DOTFILES=/path/to/dotfiles bash install-coffee.sh
 ## 開発
 
 push のたびに GitHub Actions で `bash -n` と `shellcheck -S warning` を実行しています（`.github/workflows/shellcheck.yml`）。
+
+また毎週月曜（と `install-coffee.sh` の変更時）に、インストーラーが入れる公式パッケージが今の Arch に存在するかを確認しています（`.github/workflows/packages.yml`）。Arch 側の名前変更や提供終了に、インストールで止まる前に気付くためのものです。手元では Arch 上で `pacman -Sy` のあと `bash tests/pkgcheck.sh` で同じ確認ができます。
