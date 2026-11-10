@@ -172,6 +172,8 @@ declare -A CONFIG=(
   [dry_run]="$DRY_RUN"
   [log_file]="$LOG_FILE"
   [gpu_driver]="none"
+  # NVIDIA と同居する内蔵 GPU: intel / amdgpu / 空（_detect_igpu が決める）
+  [gpu_igpu]=""
   [aur_helper]="yay"
   [extra_ssh]="no"
   [extra_ufw]="yes"
@@ -700,8 +702,36 @@ _cleanup_temp_sudoers() {
   fi
 }
 
+# run_cmd 系が裏で動かしているコマンドの PID（_exec_timed が設定する）。
+_RUN_PID=""
+
+# 指定したプロセスと、その子孫をまとめて止める。
+_kill_tree() {
+  local p="$1" c
+  for c in $(pgrep -P "$p" 2>/dev/null); do
+    _kill_tree "$c"
+  done
+  kill -TERM "$p" 2>/dev/null || true
+}
+
+# 【重要】Ctrl+C で、裏で動かしているコマンドも必ず止めること。
+# 対話でないシェルが & で起動した子は SIGINT を無視する設定になるため、
+# スクリプトだけ終了して pacstrap などが動き続け、/mnt に書き込みを続けてしまう。
 _on_interrupt() {
+  trap '' INT
+  echo ""
+  if [[ -n "${_RUN_PID:-}" ]] && kill -0 "$_RUN_PID" 2>/dev/null; then
+    echo -e "  ${YELLOW}⚠${RESET} 実行中の処理を停止しています..."
+    _kill_tree "$_RUN_PID"
+    local i
+    for i in {1..50}; do
+      kill -0 "$_RUN_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -0 "$_RUN_PID" 2>/dev/null && kill -KILL "$_RUN_PID" 2>/dev/null
+  fi
   _cleanup_temp_sudoers
+  echo -e "  ${YELLOW}⚠${RESET} 中断しました。/mnt がマウントされたままの場合は umount -R /mnt を実行してください。"
   exit 130
 }
 
@@ -830,7 +860,10 @@ _read_input() {
   local src="$2" dst="$3" mode="${4:-normal}"
   local rc=0
   if [[ "$mode" == "silent" ]]; then
-    read -rs _dest_ref < "$src" || rc=$?
+    # 【重要】IFS= を付けること。付けないと read が前後の空白を黙って削り、
+    # 空白で始まる／終わるパスワードが「入力したものと違う文字列」で登録される
+    # （確認入力も同じように削られるので一致してしまい、気付けない）。
+    IFS= read -rs _dest_ref < "$src" || rc=$?
   else
     read -r _dest_ref < "$src" || rc=$?
   fi
@@ -878,6 +911,7 @@ _exec_timed() {
   local start_ts=$SECONDS pid rc=0 elapsed
   "$@" >> "${CONFIG[log_file]}" 2>&1 < /dev/null &
   pid=$!
+  _RUN_PID="$pid"
   # 【重要】ポーリング間隔を 1 秒固定にしないこと。
   # run_cmd 系の呼び出しは 170 回以上あり、その大半は 1 秒未満で終わる。
   # 固定 1 秒だと 1 回あたり平均 0.5 秒の取りこぼしが出て、合計で
@@ -903,6 +937,7 @@ _exec_timed() {
   # 「|| rc=$?」で元の終了コードを取得する（set -e 下でも安全）
   rc=0
   wait "$pid" 2>/dev/null || rc=$?
+  _RUN_PID=""
   return "$rc"
 }
 
@@ -1178,6 +1213,22 @@ step_disk() {
     fi
   fi
 
+  # 起動中のシステムが載っているディスクを特定して除外する。
+  # 【重要】今使っている Arch から実行した場合（設定の引き継ぎ「ホストPC」で
+  # 想定している使い方）、/ や /home のあるディスクがそのまま候補に並び、
+  # 選ぶと do_partition が umount -f してから全消去してしまう。
+  # Live ISO では / が airootfs（ブロックデバイスではない）なので何も除外されない。
+  # btrfs の "/dev/sda2[/@]" や LUKS / LVM を経由していても、
+  # lsblk -s（逆依存）で親を辿れば物理ディスクに行き着く。
+  local sys_disks=() _t _src _d
+  for _t in / /boot /efi /boot/efi /home /usr /var; do
+    _src=$(findmnt -n -o SOURCE "$_t" 2>/dev/null | head -n1 | sed 's/\[.*\]$//' || true)
+    [[ "$_src" == /dev/* ]] || continue
+    while IFS= read -r _d; do
+      [[ -n "$_d" && " ${sys_disks[*]} " != *" ${_d} "* ]] && sys_disks+=("$_d")
+    done < <(lsblk -rnso NAME,TYPE "$_src" 2>/dev/null | awk '$2=="disk"{print $1}')
+  done
+
   # ディスク一覧を構築（sysfs から直接読み取り、loop・光学・ISO デバイスを除外）
   local disks=()
   for devpath in /sys/block/*; do
@@ -1196,6 +1247,9 @@ step_disk() {
 
     # ISO デバイスをスキップ
     [[ -n "$iso_dev" && "$devname" == "$iso_dev" ]] && continue
+
+    # 起動中のシステムのディスクをスキップ
+    [[ " ${sys_disks[*]} " == *" ${devname} "* ]] && continue
 
     # サイズを人間が読みやすい形式に変換
     local bytes
@@ -1239,6 +1293,7 @@ step_disk() {
     print_err "インストール先ディスクが見つかりません。"
     echo -e "\n${YELLOW}─── デバッグ・診断情報 ───${RESET}"
     echo "除外対象 (iso_dev)  : ${iso_dev:-なし}"
+    echo "除外対象 (起動中)   : ${sys_disks[*]:-なし}"
     echo "利用可能な /sys/block デバイス一覧:"
     ls /sys/block || true
     echo -e "─────────────────────────\n"
@@ -1248,6 +1303,9 @@ step_disk() {
   # ISO デバイスを除外した旨を表示
   if [[ -n "$iso_dev" ]]; then
     print_ok "Arch ISO デバイス (/dev/${iso_dev}) を候補から除外しました"
+  fi
+  if [[ "${#sys_disks[@]}" -gt 0 ]]; then
+    print_ok "起動中のシステムのディスク (${sys_disks[*]}) を候補から除外しました"
   fi
 
   echo ""
@@ -1355,26 +1413,51 @@ step_partition_scheme() {
 # ステップ 3: システム設定
 # ============================================
 
-# NVIDIA GPU の世代を lspci の表示デバイス行から判定し、new / old / unknown を返す。
+# NVIDIA GPU の世代を lspci -nn の表示デバイス行から判定し、new / old / unknown を返す。
 #
 # 【経緯】Arch は 2025年12月のドライバ 590 で、公式パッケージを nvidia から
 # nvidia-open（オープンカーネルモジュール）へ切り替え、同時に Pascal（GTX 10xx）
 # 以前のサポートを打ち切った。旧世代に nvidia-open を入れると画面が出ない。
-#   new : Turing 以降（TU / GA / AD / GB / GH）→ nvidia-open
-#   old : Pascal 以前（GP / GM / GK / GF / GT / G8x 等）→ nouveau
-# lspci は "NVIDIA Corporation TU117M [GeForce GTX 1650 Mobile]" のように
-# チップのコード名を出すので、その接頭辞で判定する。
-# 引数1: lspci の表示デバイス行（複数行可。NVIDIA の行だけを見る）
+#   new : Turing 以降 → nvidia-open
+#   old : Pascal 以前 → nouveau
+#
+# 【重要】判定は PCI デバイス ID で行う（Turing 以降は 0x1e00 以上）。
+# 以前はチップのコード名（TU117M など）を正規表現で拾っていたが、
+# GP108BM（MX250）・TU106BM・TU117GLM のように末尾の英字が2文字以上の型番を
+# 読めず、世代が分かるはずの機種まで手動選択に回っていた。
+# デバイス ID は lspci -nn が必ず [10de:1f91] の形で出すので取りこぼさない。
+# 汎用版 install.sh の _detect_gpu と同じ方式。
+# 引数1: lspci -nn の表示デバイス行（複数行可。NVIDIA の ID だけを見る）
 _nvidia_generation() {
-  local code
-  code=$(grep -i 'nvidia' <<< "$1" \
-    | grep -oE '\b(TU|GA|AD|GB|GH|GP|GM|GK|GF|GT|G)[0-9]{2,3}[A-Z]?\b' \
-    | head -n1 || true)
-  case "$code" in
-    TU*|GA*|AD*|GB*|GH*) echo "new" ;;
-    "")                  echo "unknown" ;;
-    *)                   echo "old" ;;
-  esac
+  local nv_id
+  nv_id=$(grep -oiE '\[10de:[0-9a-f]{4}\]' <<< "$1" | head -n1 | cut -c7-10 || true)
+  if [[ -z "$nv_id" ]]; then
+    echo "unknown"
+  elif (( 16#$nv_id < 16#1e00 )); then
+    echo "old"
+  else
+    echo "new"
+  fi
+}
+
+# NVIDIA と同居している内蔵 GPU（ハイブリッド構成のノート PC など）を返す。
+# 戻り値: intel / amdgpu / 空（NVIDIA 以外の表示デバイスが無い）
+#
+# 【経緯】NVIDIA を見つけた時点で判定を終えていたため、Intel + NVIDIA のノートでは
+# 内蔵側のドライバ（vulkan-intel / intel-media-driver）が入らなかった。
+# こうした機種で画面を出しているのは内蔵 GPU のほうで、動画のハードウェア
+# デコードも内蔵側が担当するため、抜けると再生が CPU 処理になる。
+# 引数1: lspci の表示デバイス行
+_detect_igpu() {
+  local others
+  others=$(grep -vi 'NVIDIA' <<< "$1" || true)
+  if grep -qE 'Advanced Micro Devices|\b(AMD|ATI)\b|Radeon' <<< "$others"; then
+    echo "amdgpu"
+  elif grep -qiw 'Intel' <<< "$others"; then
+    echo "intel"
+  else
+    echo ""
+  fi
 }
 
 step_system() {
@@ -1429,8 +1512,12 @@ step_system() {
   local detected_gpu=""
   local recommended=""
   local gpu_lines=""
-  gpu_lines=$(lspci 2>/dev/null | grep -E 'VGA compatible controller|3D controller|Display controller' || true)
+  # -nn: デバイス ID（[10de:1f91] など）も出す。NVIDIA の世代判定に使う。
+  gpu_lines=$(lspci -nn 2>/dev/null | grep -E 'VGA compatible controller|3D controller|Display controller' || true)
+  # 修正メニューからやり直したときに前回の判定が残らないよう、毎回決め直す
+  CONFIG[gpu_igpu]=""
   if grep -qiw "NVIDIA" <<< "$gpu_lines"; then
+    CONFIG[gpu_igpu]=$(_detect_igpu "$gpu_lines")
     # 【重要】NVIDIA は世代で入れるものが変わる。理由は _nvidia_generation を参照。
     case "$(_nvidia_generation "$gpu_lines")" in
       new)
@@ -1467,6 +1554,9 @@ step_system() {
     # （検出失敗時のみ下の手動選択にフォールバック）
     CONFIG[gpu_driver]="$recommended"
     print_ok "検出された GPU: ${detected_gpu} → ドライバー ${CONFIG[gpu_driver]} を自動選択"
+    if [[ -n "${CONFIG[gpu_igpu]}" ]]; then
+      print_ok "内蔵 GPU（${CONFIG[gpu_igpu]}）も検出 → 内蔵側のドライバーも導入します"
+    fi
     return
   fi
 
@@ -1501,6 +1591,31 @@ step_system() {
 # ============================================
 # ステップ 4: ユーザー設定
 # ============================================
+
+# ユーザー名がシステムのユーザー名・グループ名と衝突するかを判定する（衝突=0）。
+# useradd -m は同名のグループも作るため、既存グループ名（wheel 等）とも衝突する。
+# Live 環境の /etc/passwd・/etc/group に加え、インストール先で後から作られる
+# 代表的なシステムユーザー（SDDM・各種サービス）も固定リストで弾く。
+_is_reserved_username() {
+  local name="$1" r
+  local reserved=(
+    root bin daemon mail ftp http nobody dbus polkitd avahi colord cups rtkit
+    sddm greeter git uuidd usbmux geoclue flatpak tss alpm
+    nm-openconnect nm-openvpn brltty saned cosmic-greeter
+    wheel audio video storage optical input users lp kvm render sys adm log
+    tty disk utmp uucp network power scanner rfkill games locate proc
+  )
+  for r in "${reserved[@]}"; do
+    [[ "$name" == "$r" ]] && return 0
+  done
+  [[ "$name" == systemd-* ]] && return 0
+  # 【重要】UID/GID 1000 未満（システム用）だけを見ること。ホストPCから実行した
+  # 場合、/etc/passwd には利用者自身もいるため、全件を見ると
+  # 「今と同じユーザー名で作り直す」ことができなくなる。
+  awk -F: '$3 < 1000 {print $1}' /etc/passwd /etc/group 2>/dev/null \
+    | grep -qxF -- "$name" && return 0
+  return 1
+}
 
 step_users() {
   print_step "ユーザー設定"
@@ -1546,6 +1661,15 @@ step_users() {
       fi
       if [[ ! "$uname" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
         print_err "小文字英数字・アンダースコア・ハイフンのみ使用できます（先頭は英字）。"
+        continue
+      fi
+      if [[ ${#uname} -gt 32 ]]; then
+        print_err "ユーザー名は32文字以内にしてください。"
+        continue
+      fi
+      # 【重要】ここで弾かないと、ディスクを消した後の useradd で初めて失敗する。
+      if _is_reserved_username "$uname"; then
+        print_err "「${uname}」はシステムが使う名前のため使用できません。別の名前にしてください。"
         continue
       fi
       # 重複チェック
@@ -1600,7 +1724,15 @@ step_users() {
     #   input : 全キーボード入力を直接読める（キーロガーと同じ権限）
     #   storage / optical : systemd 以前の名残で、今は何も追加されない
     # video は brightnessctl など画面輝度の操作で使う場面があるため残す。
-    local ugroups="wheel,video"
+    #
+    # 【重要】wheel は sudo を付けたユーザーだけに入れること。
+    # polkit は wheel のメンバーを管理者として扱うため、sudoers に何も書かなくても
+    # 「pkexec + 自分のパスワード」で root になれてしまう。全員を wheel に入れると、
+    # sudo を「付与しない」と答えたユーザーにも管理者権限が渡る。
+    local ugroups="video"
+    if [[ "$usudo" != "no" ]]; then
+      ugroups="wheel,video"
+    fi
 
     # リストに追記（区切り文字は | ）
     local entry="${uname}|${upw}|${usudo}|${ushell}|${ugroups}"
@@ -2044,12 +2176,19 @@ do_partition() {
   fi
 
   # 対象ディスクのパーティションが既にマウントされていれば全てアンマウント
-  run_cmd "既存マウントの解除" bash -c "
-    for mp in \$(lsblk -lno MOUNTPOINT '${disk}' 2>/dev/null | grep -v '^$' | sort -r); do
-      umount -f \"\$mp\" 2>/dev/null || true
+  # 【重要】swapoff -a を使わないこと。ホストPCから実行した場合に、対象ディスクと
+  # 無関係なホスト自身の swap まで止めてしまう。対象ディスク上の swap だけを外す。
+  run_cmd "既存マウントの解除" bash -c '
+    disk="$1"
+    lsblk -lnpo NAME,MOUNTPOINT "$disk" 2>/dev/null | while read -r name mp; do
+      if [ "$mp" = "[SWAP]" ]; then swapoff "$name" 2>/dev/null || true; fi
     done
-    swapoff -a 2>/dev/null || true
-  "
+    lsblk -lno MOUNTPOINT "$disk" 2>/dev/null | grep -v -e "^$" -e "^\[SWAP\]$" | sort -r \
+      | while IFS= read -r mp; do
+          umount -f "$mp" 2>/dev/null || true
+        done
+    true
+  ' _ "$disk"
 
   # GPT で全消去（--zap-all は GPT/MBR 双方を破棄し、以降の --new で新規GPTが作られる）
   run_cmd "GPT テーブル初期化" sgdisk --zap-all "$disk"
@@ -2089,6 +2228,13 @@ do_partition() {
       run_cmd "root パーティション作成" \
         sgdisk --new=2:0:0 --typecode=2:8300 --change-name=2:root "$disk"
     fi
+  fi
+
+  # 【重要】ドライランではここで終えること。パーティションは実際には作っていないので、
+  # 下の「カーネルが認識するまで待つ」処理が 30 秒待ったあとエラーで止まる
+  # （パーティションの無いディスクを選んだときだけ起きるので気付きにくい）。
+  if [[ "${CONFIG[dry_run]}" == "yes" ]]; then
+    return 0
   fi
 
   # カーネルにパーティションテーブル再読込を通知
@@ -2724,6 +2870,22 @@ _collect_pacstrap_pkgs() {
       ;;
     virtual) _ps+=(mesa) ;;
   esac
+
+  # ハイブリッド構成（NVIDIA + 内蔵 GPU）: 内蔵側のドライバも入れる（_detect_igpu 参照）
+  if [[ "${CONFIG[gpu_driver]}" == "nvidia" || "${CONFIG[gpu_driver]}" == "nouveau" ]]; then
+    case "${CONFIG[gpu_igpu]:-}" in
+      intel)
+        [[ "${CONFIG[gpu_driver]}" == "nvidia" ]] && _ps+=(mesa)
+        _ps+=(vulkan-intel intel-media-driver)
+        "$_say" "内蔵 Intel GPU 用に vulkan-intel + intel-media-driver を追加（ハイブリッド構成）"
+        ;;
+      amdgpu)
+        [[ "${CONFIG[gpu_driver]}" == "nvidia" ]] && _ps+=(mesa)
+        _ps+=(vulkan-radeon)
+        "$_say" "内蔵 AMD GPU 用に vulkan-radeon を追加（ハイブリッド構成）"
+        ;;
+    esac
+  fi
 
   # 仮想環境ゲストツールの追加
   case "${CONFIG[virt_env]}" in
@@ -3554,12 +3716,17 @@ options root=PARTUUID=${root_partuuid}${sb_rootflags} rw quiet${extra_options}
 EOF"
 
     # フォールバックエントリ
-    run_cmd "arch-fallback.conf 作成" bash -c "cat > /mnt/boot/loader/entries/arch-fallback.conf << EOF
+    # 【重要】fallback イメージが実在するときだけ作ること。
+    # mkinitcpio v40（2025年11月）から、既定のプリセットは fallback イメージを
+    # 作らなくなった。無条件に書くと、選んでも起動できないエントリがメニューに並ぶ。
+    if [[ "${CONFIG[dry_run]}" != "yes" && -f /mnt/boot/initramfs-linux-fallback.img ]]; then
+      run_cmd "arch-fallback.conf 作成" bash -c "cat > /mnt/boot/loader/entries/arch-fallback.conf << EOF
 title   ${OS_NAME} (fallback)
 linux   /vmlinuz-linux
 ${ucode_line}initrd  /initramfs-linux-fallback.img
 options root=PARTUUID=${root_partuuid}${sb_rootflags} rw${extra_options}
 EOF"
+    fi
 
     # pacman フック（カーネル更新時に自動更新）
     run_cmd "systemd-boot 自動更新フック設定" \
@@ -4983,8 +5150,15 @@ do_cleanup() {
 
   # swapoff は swap がない場合でも失敗しないよう直接実行
   echo -ne "  ${CYAN}…${RESET} swap 無効化..."
-  swapoff -a 2>/dev/null && echo -e "\r  ${GREEN}✔${RESET} swap 無効化   " || \
+  # 【重要】ドライランでは実行しないこと。また swapoff -a ではなく、このインストールで
+  # 有効にした swap だけを外す（ホストPCから実行したときにホストの swap を止めない）。
+  if [[ "${CONFIG[dry_run]}" == "yes" ]]; then
+    echo -e "\r  ${YELLOW}⚠${RESET} swap 無効化 (ドライラン - スキップ)"
+  elif [[ -n "${CONFIG[swap_part]}" ]] && swapoff "${CONFIG[swap_part]}" 2>/dev/null; then
+    echo -e "\r  ${GREEN}✔${RESET} swap 無効化   "
+  else
     echo -e "\r  ${GREEN}✔${RESET} swap なし（スキップ）"
+  fi
   # インストールログを新システムに保存
   # （/tmp のログは再起動で消えるため、初回起動後のトラブルシュート用に残す）
   if [[ "${CONFIG[dry_run]}" != "yes" && -f "${CONFIG[log_file]}" && -d /mnt/var/log ]]; then
